@@ -1,0 +1,21 @@
+{
+  "name": "daemon",
+  "version": "1.0.0",
+  "main": "render.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@graphql-tools/schema": "^10.0.25",
+    "apollo-server-express": "^3.13.0",
+    "express": "^4.21.2",
+    "graphql": "^16.11.0",
+    "graphql-subscriptions": "^3.0.0",
+    "subscriptions-transport-ws": "^0.11.0",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.3"
+  }
+}
