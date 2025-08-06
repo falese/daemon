@@ -70,17 +70,8 @@ A real-time, dynamic component rendering system using GraphQL subscriptions. Thi
 Start all three services:
 
 ```bash
-# Terminal 1: Start Component Registry
-node simple-registry.js
-# → Runs on http://localhost:4000
-
-# Terminal 2: Start Component Daemon
-node simple-daemon.js
-# → Runs on http://localhost:3001
-
-# Terminal 3: Start React Frontend
-cd frontend && npm start
-# → Runs on http://localhost:3000
+# Terminal 1: Run all things
+npm start
 ```
 
 You should see:
@@ -354,131 +345,6 @@ subscription {
    };
    ```
 
-### Customizing Styles
-
-The frontend uses a modern glassmorphism design. Key style areas:
-
-- **Background**: Gradient with animated particles
-- **Cards**: Glass effect with blur and shadows
-- **Buttons**: Gradient with hover animations
-- **Typography**: Gradient text effects
-
-Modify `src/index.css` to customize the appearance.
-
-### Adding Component Actions
-
-1. **Frontend**: Add action handlers to components
-2. **Daemon**: Process actions and forward to registry
-3. **Registry**: Implement business logic for actions
-
-## 🚀 Production Deployment
-
-### Docker Setup
-
-**Registry Dockerfile:**
-
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install --production
-COPY simple-registry.js ./
-EXPOSE 4000
-CMD ["node", "simple-registry.js"]
-```
-
-**Daemon Dockerfile:**
-
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install --production
-COPY simple-daemon.js ./
-EXPOSE 3001
-CMD ["node", "simple-daemon.js"]
-```
-
-**Frontend Dockerfile:**
-
-```dockerfile
-FROM node:18-alpine AS build
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY . .
-RUN npm run build
-
-FROM nginx:alpine
-COPY --from=build /app/build /usr/share/nginx/html
-EXPOSE 80
-```
-
-### Docker Compose
-
-```yaml
-version: "3.8"
-services:
-  registry:
-    build: ./registry
-    ports:
-      - "4000:4000"
-    environment:
-      - NODE_ENV=production
-
-  daemon:
-    build: ./daemon
-    ports:
-      - "3001:3001"
-    depends_on:
-      - registry
-    environment:
-      - REGISTRY_URL=ws://registry:4000/graphql
-
-  frontend:
-    build: ./frontend
-    ports:
-      - "80:80"
-    depends_on:
-      - daemon
-```
-
-### Kubernetes Deployment
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: component-registry
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: component-registry
-  template:
-    metadata:
-      labels:
-        app: component-registry
-    spec:
-      containers:
-        - name: registry
-          image: component-registry:latest
-          ports:
-            - containerPort: 4000
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: component-registry-service
-spec:
-  selector:
-    app: component-registry
-  ports:
-    - port: 4000
-      targetPort: 4000
-  type: LoadBalancer
-```
-
 ## 🔍 Troubleshooting
 
 ### Common Issues
@@ -552,15 +418,4 @@ curl -X POST http://localhost:4000/graphql \
 
 MIT License - see LICENSE file for details.
 
-## 🙏 Acknowledgments
-
-- GraphQL community for excellent subscription patterns
-- React team for amazing frontend capabilities
-- Apollo team for GraphQL server implementation
-- Modern CSS community for glassmorphism inspiration
-
 ---
-
-**Built with ❤️ for real-time component architectures**
-
-_Want to contribute or have questions? Open an issue or submit a PR!_
