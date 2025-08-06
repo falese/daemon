@@ -1,0 +1,37 @@
+.component-card {
+  max-width: 400px;
+  margin: 0 auto 16px auto;
+  background-color: white;
+  border-radius: 8px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  padding: 24px;
+  border: 1px solid #e5e7eb;
+}
+
+.card-title {
+  font-size: 20px;
+  font-weight: bold;
+  color: #111827;
+  margin-bottom: 8px;
+}
+
+.card-content {
+  color: #6b7280;
+  line-height: 1.5;
+}
+
+.card-button {
+  margin-right: 8px;
+  padding: 8px 16px;
+  background-color: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.card-button:hover {
+  background-color: #2563eb;
+}

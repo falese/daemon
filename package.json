@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "render.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "concurrently \"node simple-registry.js\" \"node simple-daemon.js\" \"cd frontend && npm start\"",
+    "backend": "concurrently \"node simple-registry.js\" \"node simple-daemon.js\""
   },
   "author": "",
   "license": "ISC",
@@ -17,5 +18,8 @@
     "subscriptions-transport-ws": "^0.11.0",
     "uuid": "^11.1.0",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "concurrently": "^7.6.0"
   }
 }

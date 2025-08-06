@@ -1,67 +1,157 @@
 import React, { useState, useEffect } from 'react';
 
 // ========================
-// SIMPLE COMPONENT RENDERER
-// React app that connects to daemon and renders components
+// GRAPHQL WEBSOCKET CLIENT
 // ========================
 
-// ========================
-// DAEMON CLIENT
-// ========================
-
-class DaemonClient {
-  constructor() {
+class GraphQLWebSocketClient {
+  constructor(url = 'ws://localhost:3001/graphql') {
+    this.url = url;
+    this.ws = null;
     this.subscriptions = new Map();
     this.connected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
   }
 
   connect() {
-    console.log('🔌 Renderer: Connecting to daemon...');
-    setTimeout(() => {
-      this.connected = true;
-      console.log('✅ Renderer: Connected to daemon');
-      this.simulateDaemonData();
-    }, 1000);
+    console.log(`🔌 Renderer: Attempting to connect to daemon at ${this.url}`);
+    
+    return new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(this.url, 'graphql-ws');
+        
+        this.ws.onopen = () => {
+          console.log('✅ Renderer: WebSocket opened to daemon');
+          this.connected = true;
+          this.reconnectAttempts = 0;
+          
+          console.log('📡 Renderer: Sending connection_init to daemon');
+          this.send({ type: 'connection_init' });
+          resolve();
+        };
+
+        this.ws.onmessage = (event) => {
+          const message = JSON.parse(event.data);
+          console.log('📨 Renderer: Message received from daemon:', message);
+          this.handleMessage(message);
+        };
+
+        this.ws.onclose = (event) => {
+          console.log('🔌 Renderer: WebSocket closed. Code:', event.code, 'Reason:', event.reason);
+          this.connected = false;
+          this.attemptReconnect();
+        };
+
+        this.ws.onerror = (error) => {
+          console.error('❌ Renderer: WebSocket error:', error);
+          reject(error);
+        };
+
+      } catch (error) {
+        console.error('❌ Renderer: Failed to create WebSocket:', error);
+        reject(error);
+      }
+    });
+  }
+
+  send(message) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+    }
+  }
+
+  handleMessage(message) {
+    console.log('📨 Renderer: Raw message from daemon:', message);
+    
+    switch (message.type) {
+      case 'connection_ack':
+        console.log('📡 Renderer: Connection acknowledged');
+        this.startSubscription();
+        break;
+        
+      case 'data':
+        console.log('📨 Renderer: Data message received:', message);
+        const subscription = this.subscriptions.get(message.id);
+        if (subscription && message.payload?.data?.rendererUpdate) {
+          console.log('📦 Renderer: Found rendererUpdate in payload');
+          subscription.callback(message.payload.data.rendererUpdate);
+        } else {
+          console.log('❓ Renderer: No rendererUpdate found in payload:', message.payload);
+        }
+        break;
+        
+      case 'error':
+        console.error('❌ Renderer: GraphQL error:', message.payload);
+        break;
+        
+      case 'complete':
+        console.log('✅ Renderer: Subscription completed');
+        break;
+        
+      default:
+        console.log('📨 Renderer: Unknown message type:', message.type);
+    }
+  }
+
+  startSubscription() {
+    const subscriptionId = 'renderer-subscription';
+    
+    const subscription = {
+      id: subscriptionId,
+      type: 'start',
+      payload: {
+        query: `
+          subscription {
+            rendererUpdate {
+              id
+              type
+              data
+              createdAt
+            }
+          }
+        `
+      }
+    };
+
+    this.send(subscription);
+    console.log('📡 Renderer: Started subscription to daemon');
   }
 
   subscribe(callback) {
-    const id = 'daemon-sub';
-    this.subscriptions.set(id, callback);
-    console.log('📡 Renderer: Subscribed to daemon');
-    return () => this.subscriptions.delete(id);
+    const subscriptionId = 'renderer-subscription';
+    this.subscriptions.set(subscriptionId, { callback });
+    
+    return () => {
+      this.subscriptions.delete(subscriptionId);
+      if (this.connected) {
+        this.send({
+          id: subscriptionId,
+          type: 'stop'
+        });
+      }
+    };
   }
 
-  // Simulate receiving data from daemon
-  simulateDaemonData() {
-    const components = [
-      {
-        id: 'welcome-1',
-        type: 'CARD',
-        data: {
-          title: 'Hello from Registry!',
-          content: 'This component traveled: Registry → Daemon → Renderer'
-        },
-        createdAt: new Date().toISOString()
-      },
-      {
-        id: 'status-1',
-        type: 'NOTIFICATION',
-        data: {
-          message: 'Renderer successfully connected to daemon',
-          type: 'SUCCESS'
-        },
-        createdAt: new Date().toISOString()
-      }
-    ];
-
-    components.forEach((component, index) => {
+  attemptReconnect() {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      console.log(`🔄 Renderer: Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+      
       setTimeout(() => {
-        console.log('📦 Renderer: Received component from daemon:', component.id);
-        this.subscriptions.forEach(callback => {
-          callback({ data: { rendererUpdate: component } });
+        this.connect().catch(() => {
+          console.log('❌ Renderer: Reconnection failed');
         });
-      }, (index + 1) * 2000);
-    });
+      }, 2000 * this.reconnectAttempts);
+    } else {
+      console.log('❌ Renderer: Max reconnection attempts reached');
+    }
+  }
+
+  disconnect() {
+    if (this.ws) {
+      this.ws.close();
+    }
   }
 }
 
@@ -69,30 +159,52 @@ class DaemonClient {
 // RENDERING SYSTEM
 // ========================
 
-class RenderingSystem {
+class ComponentDisplaySystem {
   constructor() {
-    this.daemonClient = new DaemonClient();
+    this.graphqlClient = new GraphQLWebSocketClient();
     this.components = new Map();
     this.subscribers = new Set();
+    this.subscriptionCleanup = null;
   }
 
   async connect() {
-    this.daemonClient.connect();
-    
-    // Subscribe to daemon
-    this.daemonClient.subscribe((result) => {
-      if (result.data?.rendererUpdate) {
-        this.handleComponentFromDaemon(result.data.rendererUpdate);
-      }
-    });
+    try {
+      await this.graphqlClient.connect();
+      
+      this.subscriptionCleanup = this.graphqlClient.subscribe((component) => {
+        this.handleComponentFromDaemon(component);
+      });
 
-    this.notify({ type: 'connected' });
+      this.notify({ type: 'connected' });
+    } catch (error) {
+      console.error('❌ Renderer: Failed to connect to daemon:', error);
+      this.notify({ type: 'connection_error', error });
+    }
+  }
+
+  disconnect() {
+    if (this.subscriptionCleanup) {
+      this.subscriptionCleanup();
+    }
+    this.graphqlClient.disconnect();
+    this.notify({ type: 'disconnected' });
   }
 
   handleComponentFromDaemon(component) {
-    console.log(`📦 Renderer: Rendering component ${component.id}`);
+    console.log(`📦 Renderer: Received component from daemon:`, component);
     
     this.components.set(component.id, component);
+    this.notify({ type: 'components_changed' });
+
+    if (component.data?.autoRemove) {
+      setTimeout(() => {
+        this.removeComponent(component.id);
+      }, component.data.autoRemove);
+    }
+  }
+
+  removeComponent(componentId) {
+    this.components.delete(componentId);
     this.notify({ type: 'components_changed' });
   }
 
@@ -111,54 +223,48 @@ class RenderingSystem {
 }
 
 // ========================
-// COMPONENT RENDERERS
+// UI RENDERERS
 // ========================
 
-const ComponentRenderers = {
+const UIRenderers = {
   CARD: ({ data }) => (
-    <div className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4">
-      {data.title && (
-        <h2 className="text-xl font-bold text-gray-900 mb-2">{data.title}</h2>
-      )}
-      {data.content && (
-        <p className="text-gray-600">{data.content}</p>
+    <div className="component-card">
+      {data.title && <h2 className="card-title">{data.title}</h2>}
+      {data.content && <p className="card-content">{data.content}</p>}
+      {data.buttons && (
+        <div className="card-buttons">
+          {data.buttons.map((button, index) => (
+            <button key={index} className="card-button">
+              {button.text}
+            </button>
+          ))}
+        </div>
       )}
     </div>
   ),
 
-  NOTIFICATION: ({ data }) => {
-    const bgColor = {
-      SUCCESS: 'bg-green-100 border-green-400 text-green-700',
-      ERROR: 'bg-red-100 border-red-400 text-red-700',
-      INFO: 'bg-blue-100 border-blue-400 text-blue-700'
-    }[data.type] || 'bg-gray-100 border-gray-400 text-gray-700';
-
-    return (
-      <div className={`max-w-sm mx-auto border rounded p-4 mb-4 ${bgColor}`}>
-        <p>{data.message}</p>
-      </div>
-    );
-  },
+  NOTIFICATION: ({ data }) => (
+    <div className={`notification ${(data.type || 'info').toLowerCase()}`}>
+      {data.title && <h3 className="notification-title">{data.title}</h3>}
+      <p className="notification-message">{data.message}</p>
+    </div>
+  ),
 
   FORM: ({ data }) => (
-    <div className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4">
-      {data.title && (
-        <h2 className="text-xl font-bold text-gray-900 mb-4">{data.title}</h2>
-      )}
-      <div className="space-y-4">
+    <div className="form-container">
+      {data.title && <h2 className="form-title">{data.title}</h2>}
+      <div className="form-fields">
         {data.fields?.map((field, index) => (
-          <div key={index}>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              {field.label}
-            </label>
+          <div key={index} className="form-field">
+            <label>{field.label}</label>
             <input
               type={field.type?.toLowerCase() || 'text'}
-              className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-blue-500"
+              placeholder={field.placeholder}
             />
           </div>
         ))}
-        <button className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
-          Submit
+        <button className="form-submit">
+          {data.submitText || 'Submit'}
         </button>
       </div>
     </div>
@@ -169,117 +275,141 @@ const ComponentRenderers = {
 // REACT HOOKS
 // ========================
 
-const useRenderer = () => {
-  const [renderer] = useState(() => new RenderingSystem());
+const useComponentDisplay = () => {
+  const [displaySystem] = useState(() => new ComponentDisplaySystem());
   const [components, setComponents] = useState([]);
   const [connected, setConnected] = useState(false);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
-    const unsubscribe = renderer.subscribe((event) => {
+    const unsubscribe = displaySystem.subscribe((event) => {
       switch (event.type) {
         case 'connected':
           setConnected(true);
+          setError(null);
+          break;
+        case 'disconnected':
+          setConnected(false);
+          break;
+        case 'connection_error':
+          setConnected(false);
+          setError(event.error?.message || 'Connection failed');
           break;
         case 'components_changed':
-          setComponents(renderer.getComponents());
+          setComponents(displaySystem.getComponents());
           break;
       }
     });
 
-    renderer.connect();
+    displaySystem.connect();
 
-    return unsubscribe;
-  }, [renderer]);
+    return () => {
+      unsubscribe();
+      displaySystem.disconnect();
+    };
+  }, [displaySystem]);
 
-  return { components, connected };
+  return { components, connected, error };
 };
 
 // ========================
-// MAIN APP - THIS IS THE RENDERER
+// MAIN APP
 // ========================
 
-export default function SimpleComponentRenderer() {
-  const { components, connected } = useRenderer();
+export default function RealComponentRenderer() {
+  const { components, connected, error } = useComponentDisplay();
 
   return (
-    <div className="min-h-screen bg-gray-50 py-8">
-      <div className="max-w-2xl mx-auto px-4">
+    <div className="app-container">
+      <div className="main-content">
         {/* Header */}
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">
-            Component Renderer (React App)
-          </h1>
-          <div className="flex items-center justify-center space-x-2 mb-2">
-            <div className={`w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-            <span className="text-sm text-gray-600">
-              {connected ? 'Connected to Daemon' : 'Disconnected'}
+        <div className="header">
+          <h1 className="app-title">Component Renderer</h1>
+          <div className="status-indicator">
+            <div className={`status-dot ${connected ? 'connected' : error ? 'error' : 'connecting'}`}></div>
+            <span className="status-text">
+              {connected ? 'Connected to Daemon' : 
+               error ? `Error: ${error}` : 'Connecting...'}
             </span>
           </div>
-          <p className="text-gray-600">
-            This React app is the final step: Registry → Daemon → <strong>Renderer</strong>
+          <p className="subtitle">
+            Real-time components from Registry → Daemon → <strong>Renderer</strong>
           </p>
         </div>
 
-        {/* Flow Diagram */}
-        <div className="bg-white rounded-lg shadow p-6 mb-8">
-          <h3 className="font-bold mb-4">Complete Flow</h3>
-          <div className="text-sm space-y-3">
-            <div className="flex items-center space-x-2">
-              <div className="w-4 h-4 bg-blue-500 rounded flex items-center justify-center text-white text-xs">1</div>
-              <span><strong>Component Registry</strong> (Node.js, port 4000) publishes components</span>
-            </div>
-            <div className="ml-4 text-gray-500">↓ GraphQL Subscription</div>
-            <div className="flex items-center space-x-2">
-              <div className="w-4 h-4 bg-green-500 rounded flex items-center justify-center text-white text-xs">2</div>
-              <span><strong>Component Daemon</strong> (Node.js, port 3001) receives & forwards</span>
-            </div>
-            <div className="ml-4 text-gray-500">↓ GraphQL Subscription</div>
-            <div className="flex items-center space-x-2">
-              <div className="w-4 h-4 bg-purple-500 rounded flex items-center justify-center text-white text-xs">3</div>
-              <span><strong>Component Renderer</strong> (This React App) renders UI</span>
-            </div>
-          </div>
+        {/* Status Card */}
+        <div className="card">
+          <h3>System Status</h3>
+          <p><strong>Registry:</strong> localhost:4000</p>
+          <p><strong>Daemon:</strong> localhost:3001</p>
+          <p><strong>Renderer:</strong> {connected ? 'CONNECTED' : 'DISCONNECTED'}</p>
         </div>
 
-        {/* Components from Daemon */}
-        <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-gray-900">Components from Daemon:</h3>
-          {components.length === 0 ? (
-            <div className="text-center py-8 text-gray-500 bg-white rounded-lg">
-              {connected ? 'Waiting for components from daemon...' : 'Connecting to daemon...'}
-            </div>
-          ) : (
-            components.map(component => {
-              const Renderer = ComponentRenderers[component.type];
-              
-              if (!Renderer) {
-                return (
-                  <div key={component.id} className="bg-red-100 border border-red-400 rounded p-4">
-                    <p className="text-red-700">Unknown component type: {component.type}</p>
-                  </div>
-                );
-              }
+        {/* Error Display */}
+        {error && (
+          <div className="notification error">
+            <h3 className="notification-title">Connection Error</h3>
+            <p className="notification-message">{error}</p>
+            <p className="notification-message">Make sure the Component Daemon is running on port 3001</p>
+          </div>
+        )}
 
+        {/* Components Section */}
+        <div>
+          <h3 className="section-title">Live Components ({components.length})</h3>
+          
+          {!connected && !error && (
+            <div className="empty-state">
+              <div className="spinner"></div>
+              Connecting to daemon...
+            </div>
+          )}
+
+          {connected && components.length === 0 && (
+            <div className="empty-state">
+              Connected! Waiting for components from daemon...
+              <div style={{marginTop: '16px', fontSize: '12px', color: '#9ca3af'}}>
+                Try sending a component via the registry
+              </div>
+            </div>
+          )}
+
+          {/* Dynamic Components */}
+          {components.map(component => {
+            const ComponentRenderer = UIRenderers[component.type];
+            
+            if (!ComponentRenderer) {
               return (
-                <div key={component.id} data-component-id={component.id}>
-                  <Renderer data={component.data} />
+                <div key={component.id} className="notification error">
+                  <p>Unknown component type: {component.type}</p>
                 </div>
               );
-            })
-          )}
+            }
+
+            return (
+              <div key={component.id} data-component-id={component.id}>
+                <ComponentRenderer data={component.data} />
+              </div>
+            );
+          })}
         </div>
 
-        {/* Debug */}
-        {components.length > 0 && (
-          <details className="mt-8 bg-white rounded p-4">
-            <summary className="cursor-pointer font-medium">
-              Debug: {components.length} components received
-            </summary>
-            <pre className="mt-2 text-xs bg-gray-100 p-3 rounded overflow-auto">
-              {JSON.stringify(components, null, 2)}
-            </pre>
-          </details>
-        )}
+        {/* Test Instructions */}
+        <div className="card" style={{backgroundColor: '#eff6ff', borderColor: '#bfdbfe'}}>
+          <h3 style={{color: '#1e40af'}}>Test the System</h3>
+          <p style={{color: '#1e40af', fontSize: '14px'}}>Send a component:</p>
+          <pre style={{backgroundColor: '#dbeafe', padding: '8px', borderRadius: '4px', fontSize: '12px', color: '#1e40af'}}>
+{`curl -X POST http://localhost:4000/render \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "type": "CARD",
+    "data": {
+      "title": "Beautiful Component!",
+      "content": "This looks much better now!"
+    }
+  }'`}
+          </pre>
+        </div>
       </div>
     </div>
   );
