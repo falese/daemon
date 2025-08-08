@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Component Renderer</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f7f7fa;
+      margin: 0;
+      padding: 0;
+      color: #222;
+    }
+    .container {
+      max-width: 700px;
+      margin: 40px auto;
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 16px 0 #0001;
+      padding: 2rem 2.5rem 2.5rem 2.5rem;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 0.5em;
+      margin-bottom: 1.5em;
+    }
+    .dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: #bbb;
+      display: inline-block;
+      transition: background 0.2s;
+    }
+    .dot.connected { background: #4caf50; }
+    .dot.connecting { background: #ff9800; }
+    .dot.disconnected { background: #f44336; }
+    .components {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5em;
+    }
+    .empty {
+      text-align: center;
+      color: #888;
+      margin: 2em 0;
+    }
+    .card, .notification, .form {
+      background: #f9faff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px 0 #0001;
+      padding: 1.2em 1.5em;
+    }
+    .card-title { font-weight: bold; font-size: 1.2em; }
+    .card-subtitle { color: #666; font-size: 0.95em; margin-bottom: 0.5em; }
+    .card-content { margin: 0.7em 0; }
+    .card-actions { margin-top: 1em; }
+    .btn {
+      background: #667eea;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 0.5em 1.2em;
+      margin-right: 0.5em;
+      cursor: pointer;
+      font-size: 1em;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: #5566cc; }
+    .notification-header {
+      display: flex; align-items: center; gap: 0.7em;
+      margin-bottom: 0.5em;
+    }
+    .notification-icon {
+      font-size: 1.3em;
+      width: 1.5em; text-align: center;
+    }
+    .notification.success { border-left: 4px solid #4caf50; }
+    .notification.error { border-left: 4px solid #f44336; }
+    .notification.warning { border-left: 4px solid #ff9800; }
+    .notification.info { border-left: 4px solid #2196f3; }
+    .form-title { font-weight: bold; margin-bottom: 1em; }
+    .form-group { margin-bottom: 1em; }
+    .form-label { display: block; margin-bottom: 0.3em; }
+    .form-input, .form-select, .form-textarea {
+      width: 100%; padding: 0.5em; border: 1px solid #ccc; border-radius: 4px;
+      font-size: 1em;
+    }
+    .form-textarea { min-height: 60px; }
+    .spinner {
+      border: 3px solid #eee; border-top: 3px solid #667eea; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; display: inline-block; margin-right: 0.7em;
+    }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Component Renderer</h1>
+      <p>Real-time component delivery from Rust daemon</p>
+    </div>
+    <div class="status"><span id="statusDot" class="dot disconnected"></span><span id="statusText">Disconnected</span></div>
+    <div id="loading" style="display:none"><span class="spinner"></span>Connecting to daemon...</div>
+    <div id="components" class="components"></div>
+    <div id="empty" class="empty" style="display:none">No components yet.<br>Waiting for updates...</div>
+  </div>
+  <script>
+    // --- Minimal GraphQL-WS client and renderer ---
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const loading = document.getElementById('loading');
+    const componentsDiv = document.getElementById('components');
+    const emptyDiv = document.getElementById('empty');
+    let ws;
+    let connected = false;
+    let components = new Map();
+
+    function setStatus(state, text) {
+      statusDot.className = 'dot ' + state;
+      statusText.textContent = text;
+    }
+    function showLoading(show) {
+      loading.style.display = show ? '' : 'none';
+    }
+    function updateEmpty() {
+      emptyDiv.style.display = components.size === 0 ? '' : 'none';
+    }
+
+    function connect() {
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = `${proto}://localhost:3001/graphql`;
+      setStatus('connecting', 'Connecting...');
+      showLoading(true);
+      ws = new WebSocket(wsUrl, 'graphql-ws');
+      ws.onopen = () => {
+        setStatus('connected', 'Connected');
+        showLoading(false);
+        ws.send(JSON.stringify({ type: 'connection_init' }));
+      };
+      ws.onclose = () => {
+        setStatus('disconnected', 'Disconnected');
+        showLoading(false);
+        setTimeout(connect, 2000);
+      };
+      ws.onerror = () => {
+        setStatus('disconnected', 'Connection Error');
+      };
+      ws.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.type === 'connection_ack') {
+          ws.send(JSON.stringify({
+            id: '1',
+            type: 'start',
+            payload: {
+              query: `subscription { rendererUpdate { id type data createdAt } }`
+            }
+          }));
+        } else if (msg.type === 'data' && msg.payload?.data?.rendererUpdate) {
+          handleComponent(msg.payload.data.rendererUpdate);
+        }
+      };
+    }
+
+    function handleComponent(component) {
+      components.set(component.id, component);
+      renderComponents();
+    }
+
+    function renderComponents() {
+      componentsDiv.innerHTML = '';
+      if (components.size === 0) {
+        updateEmpty();
+        return;
+      }
+      updateEmpty();
+      for (const comp of components.values()) {
+        let el;
+        switch (comp.type) {
+          case 'CARD': el = renderCard(comp); break;
+          case 'NOTIFICATION': el = renderNotification(comp); break;
+          case 'FORM': el = renderForm(comp); break;
+          default: el = renderDefault(comp); break;
+        }
+        componentsDiv.appendChild(el);
+      }
+    }
+
+    function renderCard(comp) {
+      const d = comp.data || {};
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <div class="card-title">${escapeHtml(d.title || 'Card')}</div>
+        <div class="card-subtitle">${escapeHtml(d.subtitle || '')}</div>
+        <div class="card-content">${escapeHtml(d.content || '')}</div>
+        ${Array.isArray(d.actions) ? renderActions(d.actions) : ''}
+      `;
+      return card;
+    }
+    function renderNotification(comp) {
+      const d = comp.data || {};
+      const n = document.createElement('div');
+      n.className = 'notification ' + (d.type ? d.type.toLowerCase() : 'info');
+      const icons = { success: '✓', error: '✗', warning: '!', info: 'i' };
+      n.innerHTML = `
+        <div class="notification-header">
+          <span class="notification-icon">${icons[d.type?.toLowerCase()] || 'i'}</span>
+          <span class="notification-title">${escapeHtml(d.title || 'Notification')}</span>
+        </div>
+        <div class="notification-message">${escapeHtml(d.message || '')}</div>
+      `;
+      return n;
+    }
+    function renderForm(comp) {
+      const d = comp.data || {};
+      const f = document.createElement('div');
+      f.className = 'form';
+      f.innerHTML = `
+        <div class="form-title">${escapeHtml(d.title || 'Form')}</div>
+        <form>${renderFormFields(d.fields || [])}
+          <button type="submit" class="btn">${escapeHtml(d.submitText || 'Submit')}</button>
+        </form>
+      `;
+      f.querySelector('form').onsubmit = e => {
+        e.preventDefault();
+        alert('Form submitted!');
+      };
+      return f;
+    }
+    function renderFormFields(fields) {
+      return fields.map(field => {
+        switch (field.type) {
+          case 'text': case 'email': case 'password':
+            return `<div class="form-group"><label class="form-label">${escapeHtml(field.label)}</label><input type="${field.type}" name="${field.name}" class="form-input" placeholder="${escapeHtml(field.placeholder || '')}" ${field.required ? 'required' : ''}></div>`;
+          case 'textarea':
+            return `<div class="form-group"><label class="form-label">${escapeHtml(field.label)}</label><textarea name="${field.name}" class="form-input form-textarea" placeholder="${escapeHtml(field.placeholder || '')}" ${field.required ? 'required' : ''}></textarea></div>`;
+          case 'select':
+            return `<div class="form-group"><label class="form-label">${escapeHtml(field.label)}</label><select name="${field.name}" class="form-select" ${field.required ? 'required' : ''}>${(field.options||[]).map(opt => `<option value="${opt.value}">${escapeHtml(opt.label)}</option>`).join('')}</select></div>`;
+          default: return '';
+        }
+      }).join('');
+    }
+    function renderActions(actions) {
+      return `<div class="card-actions">${actions.map(a => `<button class="btn" onclick="alert('Action: ${escapeHtml(a.action)}')">${escapeHtml(a.label)}</button>`).join('')}</div>`;
+    }
+    function renderDefault(comp) {
+      const d = comp.data || {};
+      const el = document.createElement('div');
+      el.className = 'card';
+      el.innerHTML = `<div class="card-title">${escapeHtml(comp.type)}</div><div class="card-content">${escapeHtml(JSON.stringify(d))}</div>`;
+      return el;
+    }
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    connect();
+  </script>
+</body>
+</html>
+    </div>
+</div>
+
+<script>
+    // ========================
+    // COMPONENT RENDERER CLASS
+    // ========================
+    class ComponentRenderer {
+        constructor() {
+            this.ws = null;
+            this.components = new Map();
+    // ========================
+    // COMPONENT RENDERER CLASS
+    // ========================
+    class ComponentRenderer {
+        constructor() {
+            this.ws = null;
+            this.components = new Map();
+            this.reconnectAttempts = 0;
+            this.maxReconnectAttempts = 10;
+            this.reconnectDelay = 1000;
+            this.elements = {
+                statusBar: document.getElementById('statusBar'),
+                statusDot: document.getElementById('statusDot'),
+                statusText: document.getElementById('statusText'),
+                loadingState: document.getElementById('loadingState'),
+                componentsGrid: document.getElementById('componentsGrid'),
+                emptyState: document.getElementById('emptyState')
+            };
+            this.connect();
+        }
+        connect() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            const wsUrl = `${proto}://${window.location.hostname}:3001/graphql`;
+            this.updateStatus('connecting', 'Connecting...');
+            this.ws = new WebSocket(wsUrl, 'graphql-ws');
+            this.ws.onopen = () => {
+                this.updateStatus('connected', 'Connected');
+                this.reconnectAttempts = 0;
+                this.hideLoading();
+                this.ws.send(JSON.stringify({ type: 'connection_init' }));
+            };
+            this.ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    this.handleMessage(message);
+                } catch (e) {
+                    console.error('Malformed message:', event.data);
+                }
+            };
+            this.ws.onclose = () => {
+                this.updateStatus('disconnected', 'Disconnected');
+                this.showLoading();
+                this.attemptReconnect();
+            };
+            this.ws.onerror = () => {
+                this.updateStatus('disconnected', 'Connection Error');
+            };
+        }
+        handleMessage(message) {
+            switch (message.type) {
+                case 'connection_ack':
+                    this.startSubscription();
+                    break;
+                case 'data':
+                    if (message.payload?.data?.rendererUpdate) {
+                        this.handleComponentUpdate(message.payload.data.rendererUpdate);
+                    }
+                    break;
+                case 'error':
+                    this.updateStatus('disconnected', 'GraphQL Error');
+                    break;
+            }
+        }
+        startSubscription() {
+            this.ws.send(JSON.stringify({
+                id: 'component-subscription',
+                type: 'start',
+                payload: {
+                    query: `
+                        subscription {
+                            rendererUpdate {
+                                id
+                                type
+                                data
+                                createdAt
+                            }
+                        }
+                    `
+                }
+            }));
+        }
+                            rendererUpdate {
+                                id
+                                type
+                                data
+                                createdAt
+                            }
+                        }
+                    `
+                }
+            }));
+        }
+        startSubscription() {
+            this.ws.send(JSON.stringify({
+                id: 'component-subscription',
+                type: 'start',
+                payload: {
+                    query: `
+                        subscription {
+                            rendererUpdate {
+                                id
+                                type
+                                data
+                                createdAt
+                            }
+                        }
+                    `
+                }
+            }));
+        }
+        handleComponentUpdate(component) {
+            const id = component.id;
+            const existing = this.components.get(id);
+            if (existing) {
+                this.updateComponent(component);
+            } else {
+                this.addComponent(component);
+            }
+            this.components.set(id, component);
+            this.updateEmptyState();
+        }
+        addComponent(component) {
+            const element = this.createComponentElement(component);
+            this.elements.componentsGrid.appendChild(element);
+        }
+        updateComponent(component) {
+            const element = document.querySelector(`[data-component-id="${component.id}"]`);
+            if (element) {
+                element.classList.add('updating');
+                setTimeout(() => element.classList.remove('updating'), 600);
+                const newElement = this.createComponentElement(component);
+                element.innerHTML = newElement.innerHTML;
+            }
+        }
+        createComponentElement(component) {
+            const element = document.createElement('div');
+            element.className = `component ${String(component.type).toLowerCase()}`;
+            element.setAttribute('data-component-id', component.id);
+            switch (component.type) {
+                case 'CARD':
+                    element.innerHTML = this.renderCard(component);
+                    break;
+                case 'NOTIFICATION':
+                    element.innerHTML = this.renderNotification(component);
+                    break;
+                case 'FORM':
+                    element.innerHTML = this.renderForm(component);
+                    break;
+                default:
+                    element.innerHTML = this.renderDefault(component);
+            }
+            return element;
+        }
+        renderCard(component) {
+            const data = component.data || {};
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">${this.escapeHtml(data.title || 'Card Title')}</div>
+                        <div class="card-subtitle">${this.escapeHtml(data.subtitle || '')}</div>
+                    </div>
+                    <div class="card-body">
+                        <div class="card-content">
+                            ${this.escapeHtml(data.content || 'Card content goes here...')}
+                        </div>
+                        ${data.actions ? this.renderActions(data.actions) : ''}
+                    </div>
+                    ${this.renderComponentMeta(component)}
+                </div>
+            `;
+        }
+        renderNotification(component) {
+            const data = component.data || {};
+            const type = (data.type || 'info').toLowerCase();
+            const icons = { success: '✓', error: '✗', warning: '!', info: 'i' };
+            return `
+                <div class="notification ${type}">
+                    <div class="notification-header">
+                        <div class="notification-icon">${icons[type] || 'i'}</div>
+                        <div class="notification-title">${this.escapeHtml(data.title || 'Notification')}</div>
+                    </div>
+                    <div class="notification-message">
+                        ${this.escapeHtml(data.message || 'Notification message')}
+                    </div>
+                    ${this.renderComponentMeta(component)}
+                </div>
+            `;
+        }
+        renderForm(component) {
+            const data = component.data || {};
+            return `
+                <div class="form">
+                    <div class="form-title">${this.escapeHtml(data.title || 'Form')}</div>
+                    <form onsubmit="renderer.handleFormSubmit(event, '${component.id}')">
+                        ${this.renderFormFields(data.fields || [])}
+                        <button type="submit" class="btn btn-primary">
+                            ${this.escapeHtml(data.submitText || 'Submit')}
+                        </button>
+                    </form>
+                    ${this.renderComponentMeta(component)}
+                </div>
+            `;
+        }
+        renderFormFields(fields) {
+            return fields.map(field => {
+                switch (field.type) {
+                    case 'text':
+                    case 'email':
+                    case 'password':
+                        return `
+                            <div class="form-group">
+                                <label class="form-label">${this.escapeHtml(field.label)}</label>
+                                <input 
+                                    type="${field.type}" 
+                                    name="${field.name}"
+                                    class="form-input" 
+                                    placeholder="${this.escapeHtml(field.placeholder || '')}"
+                                    ${field.required ? 'required' : ''}
+                                >
+                            </div>
+                        `;
+                    case 'textarea':
+                        return `
+                            <div class="form-group">
+                                <label class="form-label">${this.escapeHtml(field.label)}</label>
+                                <textarea 
+                                    name="${field.name}"
+                                    class="form-input form-textarea" 
+                                    placeholder="${this.escapeHtml(field.placeholder || '')}"
+                                    ${field.required ? 'required' : ''}
+                                ></textarea>
+                            </div>
+                        `;
+                    case 'select':
+                        return `
+                            <div class="form-group">
+                                <label class="form-label">${this.escapeHtml(field.label)}</label>
+                                <select name="${field.name}" class="form-select" ${field.required ? 'required' : ''}>
+                                    ${(field.options || []).map(opt => 
+                                        `<option value="${opt.value}">${this.escapeHtml(opt.label)}</option>`
+                                    ).join('')}
+                                </select>
+                            </div>
+                        `;
+                    default:
+                        return '';
+                }
+            }).join('');
+        }
+        renderActions(actions) {
+            return `
+                <div class="card-actions">
+                    ${actions.map(action => `
+                        <button 
+                            class="btn btn-${action.style || 'primary'}"
+                            onclick="renderer.handleAction('${action.id}', '${action.action}')"
+                        >
+    // (removed duplicate class definition)
+    document.addEventListener('DOMContentLoaded', () => {
+        renderer = new ComponentRenderer();
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && renderer && (!renderer.ws || renderer.ws.readyState !== WebSocket.OPEN)) {
+            renderer.connect();
+        }
+    });
