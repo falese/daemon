@@ -1,0 +1,57 @@
+services:
+  registry:
+    build:
+      context: ./component-system/registry
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    networks:
+      - component-network
+
+  rust-daemon:
+    build:
+      context: ./component-system/daemon/rust/component-daemon
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    depends_on:
+      - registry
+    networks:
+      - component-network
+
+  node-daemon:
+    build:
+      context: ./component-system/daemon
+      dockerfile: Dockerfile
+    ports:
+      - "3002:3002"
+    depends_on:
+      - registry
+    networks:
+      - component-network
+
+  react-renderer:
+    build:
+      context: ./component-system/renderer/frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - registry
+    networks:
+      - component-network
+
+  html-renderer:
+    build:
+      context: ./component-system/renderer/html
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      - registry
+    networks:
+      - component-network
+
+networks:
+  component-network:
+    driver: bridge
