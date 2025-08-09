@@ -180,10 +180,10 @@ async function startRegistry(port = 4000) {
     { server: httpServer, path: '/graphql' }
   );
 
-  httpServer.listen(port, () => {
-    console.log(`🚀 Component Registry running on http://localhost:${port}`);
-    console.log(`📡 GraphQL: http://localhost:${port}/graphql`);
-    console.log(`🔌 REST: http://localhost:${port}/render`);
+  httpServer.listen(port, '0.0.0.0', () => {
+    console.log(`🚀 Component Registry running on http://0.0.0.0:${port}`);
+    console.log(`📡 GraphQL: http://0.0.0.0:${port}/graphql`);
+    console.log(`🔌 REST: http://0.0.0.0:${port}/render`);
   });
 
   // Send a test component after startup

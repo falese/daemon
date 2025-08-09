@@ -1,11 +1,12 @@
-# Vibe Code Slop Daemon prototype
+# Dynamic Component Rendering System
 
-A real-time, dynamic component rendering system using GraphQL subscriptions. This architecture enables backend services to render UI components on frontend clients through a middleware daemon service.
+A distributed, real-time component rendering system built with GraphQL, Rust, Node.js, and React. This architecture enables dynamic UI updates across multiple renderers through a high-performance daemon service.
 
-![Architecture Flow](https://img.shields.io/badge/Flow-Registry%20→%20Daemon%20→%20Renderer-brightgreen)
+![Architecture](https://img.shields.io/badge/Architecture-Microservices-blue)
+![Rust](https://img.shields.io/badge/Rust-Daemon-orange)
 ![GraphQL](https://img.shields.io/badge/GraphQL-Subscriptions-E10098)
-![React](https://img.shields.io/badge/React-18+-61DAFB)
-![Node.js](https://img.shields.io/badge/Node.js-18+-339933)
+![React](https://img.shields.io/badge/React-Frontend-61DAFB)
+![Docker](https://img.shields.io/badge/Docker-Containers-2496ED)
 
 ## 🏗️ Architecture Overview
 
@@ -37,48 +38,83 @@ A real-time, dynamic component rendering system using GraphQL subscriptions. Thi
 
 ### Prerequisites
 
-- Node.js 18+
-- npm or yarn
-- Modern web browser
+- Docker and Docker Compose
+- Modern web browser (for accessing renderers)
+- curl (for testing)
 
 ### Installation
 
-1. **Clone and setup the project:**
+1. **Clone the repository:**
 
    ```bash
-   mkdir component-system && cd component-system
-   npm init -y
-   npm install apollo-server-express express graphql graphql-subscriptions subscriptions-transport-ws @graphql-tools/schema uuid ws
+   git clone <repository-url>
+   cd daemon
    ```
 
-2. **Create the three core files:**
+2. **Start services using Make:**
 
-   - `simple-registry.js` - Component Registry backend
-   - `simple-daemon.js` - Component Daemon middleware
-   - React App for frontend rendering
-
-3. **Create React frontend:**
    ```bash
-   npx create-react-app frontend
-   cd frontend
-   # Replace src/App.js with the provided renderer code
-   # Update src/index.css with the glassmorphism styles
+   # Build all images
+   make build
+
+   # Start everything at once
+   make all
+
+   # OR use interactive stack launcher
+   make stack  # Guides you through daemon and renderer selection
    ```
 
-### Running the System
+The `make stack` command provides an interactive way to choose:
 
-Start all three services:
+- Which daemon to run (Rust or Node.js)
+- Which renderer to use (React or HTML)
 
-```bash
-# Terminal 1: Run all things
-npm start
-```
+Individual commands are also available:
+
+- `make rust-daemon` - Start the Rust daemon
+- `make node-daemon` - Start the Node.js daemon
+- `make react-renderer` - Start the React frontend
+- `make html-renderer` - Start the HTML renderer
+
+This will start the selected services:
+
+- Registry (Node.js) on port 4000
+- Rust Daemon on port 3001 (if selected)
+- Node Daemon on port 3002 (if selected)
+- React Renderer on port 3000 (if selected)
+- HTML Renderer on port 8081 (if selected)
+
+### Verifying the System
+
+After starting the services with Docker Compose, verify each component:
+
+1. **Check service status:**
+
+   ```bash
+   docker-compose ps
+   ```
+
+   All services should show as "Up"
+
+2. **Check component health:**
+
+   - Registry: Visit http://localhost:4000
+   - Rust Daemon: Visit http://localhost:3001
+   - React Renderer: Visit http://localhost:3000
+   - HTML Renderer: Visit http://localhost:8081
+
+3. **View service logs:**
+   ```bash
+   docker-compose logs -f
+   ```
 
 You should see:
 
-- ✅ Registry: `📡 Registry: New daemon subscription connected`
-- ✅ Daemon: `📦 Daemon: Received component from registry`
-- ✅ Frontend: `📦 Renderer: Connected to daemon`
+- ✅ Registry: Service ready on port 4000
+- ✅ Rust Daemon: Connected to registry
+- ✅ Node Daemon: Connected to registry
+- ✅ React Renderer: WebSocket connection established
+- ✅ HTML Renderer: Server running
 
 ## 🧪 Testing the System
 
@@ -221,14 +257,43 @@ Dynamic forms with configurable fields.
 
 ## 🔧 Architecture Deep Dive
 
-### Component Registry (`simple-registry.js`)
+### Service Roles
 
-**Purpose**: Backend service that manages component lifecycle
+1. **Registry (`registry/simple-registry.js`)**
 
-- **GraphQL API**: Publishes components via subscriptions
-- **REST API**: Simple HTTP interface for external services
-- **Component Storage**: In-memory component management
-- **Event Publishing**: Real-time updates to connected daemons
+   - Node.js service managing component lifecycle
+   - GraphQL subscriptions for real-time updates
+   - REST API for component creation
+   - In-memory component management
+   - Runs in Docker container on port 4000
+
+2. **Rust Daemon (`daemon/rust/component-daemon/src/main.rs`)**
+
+   - High-performance component processor
+   - Written in Rust using Warp and async-graphql
+   - Subscribes to registry updates
+   - Routes components to renderers
+   - Runs in Docker container on port 3001
+
+3. **Node Daemon (`daemon/simple-daemon.js`)**
+
+   - Alternative daemon implementation in Node.js
+   - Same functionality as Rust daemon
+   - Demonstrates technology flexibility
+   - Runs in Docker container on port 3002
+
+4. **React Renderer (`renderer/frontend`)**
+
+   - Dynamic component rendering
+   - Real-time updates via WebSocket
+   - Modern UI with animations
+   - Runs in Docker container on port 3000
+
+5. **HTML Renderer (`renderer/html`)**
+   - Static HTML rendering alternative
+   - Lightweight deployment option
+   - Basic component display
+   - Runs in Docker container on port 8081
 
 **Key Features:**
 
@@ -351,9 +416,13 @@ subscription {
 
 **Registry not publishing components:**
 
-- Check GraphQL subscription server is running
-- Verify PubSub is using `asyncIterableIterator` method
-- Ensure components are being published to correct channel
+- Run `make logs` and check registry output
+- Verify registry service is up with `docker-compose ps`
+- If needed, restart registry:
+  ```bash
+  docker-compose stop registry
+  make up  # Restarts registry
+  ```
 
 **Daemon not receiving components:**
 
@@ -369,21 +438,32 @@ subscription {
 
 ### Debug Commands
 
-**Check Registry Health:**
+**Service Management:**
 
 ```bash
+# Stop all services
+make down
+
+# Rebuild and restart all services
+make build && make all
+
+# View logs for all services
+make logs
+
+# Interactive service selection
+make stack
+```
+
+**Health Checks:**
+
+```bash
+# Registry health
 curl http://localhost:4000/
-```
 
-**Check Daemon Health:**
-
-```bash
+# Daemon health
 curl http://localhost:3001/
-```
 
-**Test Registry GraphQL:**
-
-```bash
+# Test Registry GraphQL
 curl -X POST http://localhost:4000/graphql \
   -H "Content-Type: application/json" \
   -d '{"query": "query { components { id type } }"}'
@@ -391,30 +471,134 @@ curl -X POST http://localhost:4000/graphql \
 
 ### Log Analysis
 
-**Registry Logs:**
+**View All Logs:**
+
+```bash
+# View all service logs
+make logs
+
+# View logs for specific service
+docker-compose logs registry
+docker-compose logs rust-daemon
+docker-compose logs react-renderer
+```
+
+**Common Log Messages:**
+
+**Registry Logs (`make logs registry`):**
 
 - `📦 Registry: Publishing component` - Component created
 - `📡 Registry: New daemon subscription connected` - Daemon connected
 
-**Daemon Logs:**
+**Daemon Logs (`make logs rust-daemon` or `make logs node-daemon`):**
 
 - `📦 Daemon: Received component from registry` - Component received
 - `📦 Daemon: Forwarding component to renderer` - Component forwarded
 
-**Frontend Logs:**
+**Frontend Logs (`make logs react-renderer` or `make logs html-renderer`):**
 
 - `📦 Renderer: Received component from daemon` - Component received
 - `✅ Renderer: Connected to daemon` - Connection established
+
+**Interactive Stack Management:**
+
+```bash
+# Start services interactively
+make stack
+
+# This allows you to:
+# 1. Choose your daemon (Rust or Node.js)
+# 2. Choose your renderer (React or HTML)
+# 3. View logs for selected components
+```
 
 ## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Add tests for new functionality
+4. Build and test:
+
+   ```bash
+   # Build all services
+   make build
+
+   # Start stack interactively
+   make stack
+
+   # Run tests (after selecting components)
+   curl -X POST http://localhost:4000/render \
+     -H "Content-Type: application/json" \
+     -d '{"type":"NOTIFICATION","data":{"type":"SUCCESS","title":"Test","message":"Test"}}'
+   ```
+
 5. Submit a pull request
 
-## 📄 License
+## � Development Workflow
+
+### Local Development
+
+1. **Start Base Services:**
+
+   ```bash
+   # Start registry only
+   make up
+   ```
+
+2. **Choose Your Stack:**
+
+   ```bash
+   # Interactive component selection
+   make stack
+   ```
+
+3. **Development Loop:**
+
+   ```bash
+   # Rebuild specific service
+   docker-compose build rust-daemon
+
+   # Restart service
+   make rust-daemon
+
+   # View logs
+   make logs
+   ```
+
+### Common Development Tasks
+
+1. **Switch Daemons:**
+
+   ```bash
+   # Stop current daemon
+   docker-compose stop rust-daemon
+
+   # Start alternative
+   make node-daemon
+   ```
+
+2. **Change Renderers:**
+
+   ```bash
+   # Stop current renderer
+   docker-compose stop react-renderer
+
+   # Start alternative
+   make html-renderer
+   ```
+
+3. **Full System Restart:**
+
+   ```bash
+   # Stop all services
+   make down
+
+   # Rebuild and restart
+   make build
+   make all
+   ```
+
+## �📄 License
 
 MIT License - see LICENSE file for details.
 

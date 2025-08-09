@@ -89,7 +89,9 @@ impl ComponentDaemon {
     }
 
     async fn try_connect_to_registry(&self) -> Result<()> {
-        let url = "ws://localhost:4000/graphql";
+        let registry_host = std::env::var("REGISTRY_HOST").unwrap_or_else(|_| "registry".to_string());
+        let registry_port = std::env::var("REGISTRY_PORT").unwrap_or_else(|_| "4000".to_string());
+        let url = format!("ws://{registry_host}:{registry_port}/graphql");
         
         info!("🔌 Daemon: Attempting to connect to {}", url);
         
@@ -97,8 +99,8 @@ impl ComponentDaemon {
         use tokio_tungstenite::tungstenite;
         
         let request = tungstenite::http::Request::builder()
-            .uri(url)
-            .header("Host", "localhost:4000")
+            .uri(&url)
+            .header("Host", format!("{registry_host}:{registry_port}"))
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
@@ -411,12 +413,12 @@ pub async fn start_daemon(port: u16) -> Result<()> {
                 .allow_methods(vec!["GET", "POST"])
         );
 
-    info!("🚀 Component Daemon running on http://localhost:{}", port);
-    info!("📡 GraphQL: http://localhost:{}/graphql", port);
-    info!("🎮 Playground: http://localhost:{}/playground", port);
+    info!("🚀 Component Daemon running on http://0.0.0.0:{}", port);
+    info!("📡 GraphQL: http://0.0.0.0:{}/graphql", port);
+    info!("🎮 Playground: http://0.0.0.0:{}/playground", port);
 
     warp::serve(routes)
-        .run(([127, 0, 0, 1], port))
+        .run(([0, 0, 0, 0], port))
         .await;
 
     Ok(())

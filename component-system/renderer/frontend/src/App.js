@@ -10,7 +10,7 @@ import React, { useState, useEffect } from 'react';
 // ========================
 
 class GraphQLWebSocketClient {
-  constructor(url = 'ws://localhost:3001/graphql') {
+  constructor(url = `ws://${window.location.hostname}:3001/graphql`) {
     this.url = url;
     this.ws = null;
     this.subscriptions = new Map();
