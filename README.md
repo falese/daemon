@@ -1,4 +1,4 @@
-# Dynamic Component Rendering System
+# Vibe Coded Slop Daemon
 
 A distributed, real-time component rendering system built with GraphQL, Rust, Node.js, and React. This architecture enables dynamic UI updates across multiple renderers through a high-performance daemon service.
 
