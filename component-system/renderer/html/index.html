@@ -1,541 +1,303 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Component Renderer in a stupid single html file</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>HTML Component Renderer</title>
   <style>
-    body {
-      font-family: system-ui, sans-serif;
-      background: #f7f7fa;
-      margin: 0;
-      padding: 0;
-      color: #222;
-    }
-    .container {
-      max-width: 700px;
-      margin: 40px auto;
-      background: #fff;
-      border-radius: 10px;
-      box-shadow: 0 2px 16px 0 #0001;
-      padding: 2rem 2.5rem 2.5rem 2.5rem;
-    }
-    .header {
-      text-align: center;
-      margin-bottom: 2rem;
-    }
-    .status {
-      display: flex;
-      align-items: center;
-      gap: 0.5em;
-      margin-bottom: 1.5em;
-    }
-    .dot {
-      width: 12px; height: 12px; border-radius: 50%;
-      background: #bbb;
-      display: inline-block;
-      transition: background 0.2s;
-    }
-    .dot.connected { background: #4caf50; }
-    .dot.connecting { background: #ff9800; }
-    .dot.disconnected { background: #f44336; }
-    .components {
-      display: flex;
-      flex-direction: column;
-      gap: 1.5em;
-    }
-    .empty {
-      text-align: center;
-      color: #888;
-      margin: 2em 0;
-    }
-    .card, .notification, .form {
-      background: #f9faff;
-      border-radius: 8px;
-      box-shadow: 0 1px 4px 0 #0001;
-      padding: 1.2em 1.5em;
-    }
-    .card-title { font-weight: bold; font-size: 1.2em; }
-    .card-subtitle { color: #666; font-size: 0.95em; margin-bottom: 0.5em; }
-    .card-content { margin: 0.7em 0; }
-    .card-actions { margin-top: 1em; }
-    .btn {
-      background: #667eea;
-      color: #fff;
-      border: none;
-      border-radius: 4px;
-      padding: 0.5em 1.2em;
-      margin-right: 0.5em;
-      cursor: pointer;
-      font-size: 1em;
-      transition: background 0.2s;
-    }
-    .btn:hover { background: #5566cc; }
-    .notification-header {
-      display: flex; align-items: center; gap: 0.7em;
-      margin-bottom: 0.5em;
-    }
-    .notification-icon {
-      font-size: 1.3em;
-      width: 1.5em; text-align: center;
-    }
-    .notification.success { border-left: 4px solid #4caf50; }
-    .notification.error { border-left: 4px solid #f44336; }
-    .notification.warning { border-left: 4px solid #ff9800; }
-    .notification.info { border-left: 4px solid #2196f3; }
-    .form-title { font-weight: bold; margin-bottom: 1em; }
-    .form-group { margin-bottom: 1em; }
-    .form-label { display: block; margin-bottom: 0.3em; }
-    .form-input, .form-select, .form-textarea {
-      width: 100%; padding: 0.5em; border: 1px solid #ccc; border-radius: 4px;
-      font-size: 1em;
-    }
-    .form-textarea { min-height: 60px; }
-    .spinner {
-      border: 3px solid #eee; border-top: 3px solid #667eea; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; display: inline-block; margin-right: 0.7em;
-    }
-    @keyframes spin { 100% { transform: rotate(360deg); } }
+    body { font-family: system-ui, sans-serif; background:#f5f7fb; margin:0; }
+    .container { max-width: 840px; margin:40px auto; background:#fff; padding:2rem 2.5rem 3rem; border-radius:14px; box-shadow:0 4px 32px -8px rgba(0,0,0,.15); }
+    h1 { margin:0 0 .3rem; font-size:1.9rem; letter-spacing:.5px; }
+    .subtitle { margin:0 0 1.5rem; color:#666; }
+    .status { display:flex; align-items:center; gap:.6rem; margin-bottom:1.25rem; font-size:.95rem; }
+    .dot { width:12px; height:12px; border-radius:50%; background:#bbb; box-shadow:0 0 0 3px #00000008; }
+    .dot.connecting { background:#ff9800; }
+    .dot.connected { background:#4caf50; }
+    .dot.disconnected { background:#f44336; }
+    #components { display:flex; flex-direction:column; gap:1.25rem; }
+    .empty { text-align:center; padding:2.5rem 1rem; color:#888; font-size:.95rem; }
+    .panel { background:#f9faff; border:1px solid #e7ecf5; border-radius:10px; padding:1.1rem 1.25rem 1.25rem; position:relative; overflow:hidden; }
+    .panel:before { content:""; position:absolute; inset:0; background:linear-gradient(145deg,#ffffff88,#f1f5ff); opacity:0; pointer-events:none; transition:opacity .35s; }
+    .panel.updating:before { opacity:1; animation:pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:0} 50%{opacity:.4} }
+    .component-meta { margin-top:.9rem; font-size:.65rem; text-transform:uppercase; letter-spacing:.5px; color:#8392a7; display:flex; gap:.75rem; }
+    .card-title { font-weight:600; font-size:1.15rem; }
+    .card-subtitle { color:#6b7280; font-size:.8rem; margin-top:.15rem; }
+    .card-content { margin:.75rem 0 .5rem; line-height:1.4; }
+    .card-actions { margin-top:.6rem; display:flex; flex-wrap:wrap; gap:.5rem; }
+    .notification { border-left:5px solid #2196f3; }
+    .notification.success { border-left-color:#4caf50; }
+    .notification.error { border-left-color:#f44336; }
+    .notification.warning { border-left-color:#ff9800; }
+    .notification .notification-title { font-weight:600; }
+    .form-title { font-weight:600; margin-bottom:.9rem; font-size:1.05rem; }
+    form .form-group { margin-bottom:.75rem; }
+    .form-label { display:block; font-size:.75rem; font-weight:600; margin-bottom:.35rem; letter-spacing:.5px; text-transform:uppercase; color:#4b5563; }
+    .form-input, .form-select, .form-textarea { width:100%; box-sizing:border-box; padding:.55rem .65rem; font-size:.95rem; border:1px solid #d0d7e2; border-radius:6px; background:#fff; font-family:inherit; }
+    .form-textarea { min-height:70px; resize:vertical; }
+    button, .btn { cursor:pointer; font-family:inherit; font-weight:500; border:none; border-radius:6px; background:#6366f1; color:#fff; padding:.55rem 1.05rem; font-size:.85rem; line-height:1.1; box-shadow:0 2px 6px -2px rgba(79,70,229,.4); transition:background .2s, transform .15s; }
+    button:hover, .btn:hover { background:#4f46e5; }
+    button:active, .btn:active { transform:translateY(1px); }
+    .btn.secondary { background:#64748b; }
+    .btn.secondary:hover { background:#475569; }
+    .badge { display:inline-block; background:#e2e8f0; color:#475569; border-radius:100px; padding:.2rem .55rem; font-size:.6rem; font-weight:600; letter-spacing:.5px; text-transform:uppercase; }
+    .actions-inline { display:flex; gap:.4rem; flex-wrap:wrap; }
+    .action-acked { background:#4caf50 !important; }
+    .snapshot-note { font-size:.6rem; font-weight:600; letter-spacing:.6px; color:#64748b; margin-left:auto; }
+    .divider { height:1px; background:linear-gradient(90deg,#edf2f7,#dde3ed,#edf2f7); margin:1rem 0 .75rem; border-radius:1px; }
+    pre { font-size:.7rem; background:#0f172a; color:#f8fafc; padding:.6rem .8rem; border-radius:6px; overflow:auto; line-height:1.35; }
+    .rule-eval { margin-top:.6rem; background:#eef6ff; border:1px solid #d2e8ff; padding:.5rem .6rem .55rem; border-radius:8px; }
+    .rule-eval-header { font-size:.6rem; font-weight:600; letter-spacing:.6px; color:#2563eb; text-transform:uppercase; display:flex; gap:.4rem; align-items:center; }
+    .rule-badge { background:#2563eb; color:#fff; font-size:.55rem; padding:.15rem .4rem; border-radius:4px; font-weight:600; letter-spacing:.5px; }
+    .rule-facts { margin:.4rem 0 0; font-size:.6rem; line-height:1.25; color:#334155; display:flex; flex-wrap:wrap; gap:.35rem; }
+    .rule-fact { background:#fff; border:1px solid #c4ddff; padding:.15rem .4rem; border-radius:999px; }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="header">
-      <h1>Component Renderer</h1>
-      <p>Real-time component delivery from Rust daemon in a stupid single HTML file</p>
-    </div>
-    <div class="status"><span id="statusDot" class="dot disconnected"></span><span id="statusText">Disconnected</span></div>
-    <div id="loading" style="display:none"><span class="spinner"></span>Connecting to daemon...</div>
-    <div id="components" class="components"></div>
-    <div id="empty" class="empty" style="display:none">No components yet.<br>Waiting for updates...</div>
+    <h1>HTML Component Renderer</h1>
+    <p class="subtitle">Prototype renderer consuming daemon realtime envelopes (transport-ws)</p>
+    <div class="status"><span id="statusDot" class="dot disconnected"></span><span id="statusText">Disconnected</span><span id="snapshotInfo" class="snapshot-note" style="display:none;">snapshot applied</span></div>
+    <div id="components"></div>
+    <div id="empty" class="empty">No components yet.<br/>Waiting for updates…</div>
+    <div class="divider"></div>
+    <details>
+      <summary style="cursor:pointer;font-size:.8rem;letter-spacing:.5px;">Debug Stream</summary>
+      <pre id="debug"></pre>
+    </details>
   </div>
   <script>
-    // --- Minimal GraphQL-WS client and renderer ---
+    // =============================
+    // Transport / Subscription Setup
+    // =============================
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
-    const loading = document.getElementById('loading');
+    const debugPre = document.getElementById('debug');
     const componentsDiv = document.getElementById('components');
     const emptyDiv = document.getElementById('empty');
-    let ws;
-    let connected = false;
-    let components = new Map();
+    const snapshotInfo = document.getElementById('snapshotInfo');
 
-    function setStatus(state, text) {
-      statusDot.className = 'dot ' + state;
-      statusText.textContent = text;
-    }
-    function showLoading(show) {
-      loading.style.display = show ? '' : 'none';
-    }
-    function updateEmpty() {
-      emptyDiv.style.display = components.size === 0 ? '' : 'none';
+    const WS_PROTOCOL = 'graphql-transport-ws';
+    const SUB_QUERY = `subscription DaemonMessages {\n  messages {\n    direction\n    kind\n    payload\n    metadata { correlationId acknowledged error }\n  }\n}`;
+
+    // Local state
+    const componentStore = new Map(); // id -> component
+    const actionAcks = new Set(); // echoed action ids
+
+    let ws; let reconnectTimer; let reconnectAttempts = 0;
+
+    function status(state, text){
+      statusDot.className = 'dot ' + state; statusText.textContent = text; }
+
+    function logDebug(obj){
+      const line = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+      debugPre.textContent = (debugPre.textContent + '\n' + line).trim().split('\n').slice(-400).join('\n');
     }
 
-    function connect() {
-      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const wsUrl = `${proto}://localhost:3001/graphql`;
-      setStatus('connecting', 'Connecting...');
-      showLoading(true);
-      ws = new WebSocket(wsUrl, 'graphql-ws');
+    function connect(){
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = proto + '://' + location.hostname + ':3001/graphql';
+      status('connecting','Connecting…');
+      ws = new WebSocket(url, WS_PROTOCOL);
       ws.onopen = () => {
-        setStatus('connected', 'Connected');
-        showLoading(false);
-        ws.send(JSON.stringify({ type: 'connection_init' }));
+        reconnectAttempts = 0; status('connected','Connected');
+        ws.send(JSON.stringify({ type:'connection_init'}));
       };
-      ws.onclose = () => {
-        setStatus('disconnected', 'Disconnected');
-        showLoading(false);
-        setTimeout(connect, 2000);
-      };
-      ws.onerror = () => {
-        setStatus('disconnected', 'Connection Error');
-      };
-      ws.onmessage = (event) => {
-        let msg;
-        try { msg = JSON.parse(event.data); } catch { return; }
-        if (msg.type === 'connection_ack') {
-          ws.send(JSON.stringify({
-            id: '1',
-            type: 'start',
-            payload: {
-              query: `subscription { rendererUpdate { id type data createdAt } }`
-            }
-          }));
-        } else if (msg.type === 'data' && msg.payload?.data?.rendererUpdate) {
-          handleComponent(msg.payload.data.rendererUpdate);
+      ws.onclose = () => { status('disconnected','Disconnected'); scheduleReconnect(); };
+      ws.onerror = () => { status('disconnected','Error'); };
+      ws.onmessage = evt => handleWs(JSON.parse(evt.data));
+    }
+
+    function scheduleReconnect(){
+      clearTimeout(reconnectTimer);
+      const delay = Math.min(5000, 500 * Math.pow(1.6, reconnectAttempts++));
+      reconnectTimer = setTimeout(connect, delay);
+    }
+
+    function handleWs(msg){
+      switch(msg.type){
+        case 'connection_ack':
+          ws.send(JSON.stringify({ id:'daemon-msg-sub', type:'subscribe', payload:{ query: SUB_QUERY } }));
+          break;
+        case 'next':
+          if(msg.payload?.data?.messages){
+            handleDaemonEnvelope(msg.payload.data.messages);
+          }
+          break;
+        case 'error':
+          logDebug(['GraphQL error', msg]);
+          break;
+        case 'complete':
+          logDebug('Subscription complete');
+          break;
+        case 'ping':
+          ws.send(JSON.stringify({ type:'pong'}));
+          break;
+      }
+    }
+
+    // =============================
+    // Envelope Handling
+    // =============================
+    function handleDaemonEnvelope(env){
+      logDebug(env);
+      if(env.direction === 'COMPONENT'){
+        if(env.kind === 'STATE_SNAPSHOT'){
+          applySnapshot(env.payload);
+        } else if(env.kind === 'COMPONENT_UPDATE'){ upsertComponent(env.payload); }
+        else { // legacy or unspecified treat as component
+          if(env.payload?.id && env.payload?.type) upsertComponent(env.payload);
         }
-      };
+      } else if(env.direction === 'ACTION' && env.kind === 'ACTION_ECHO'){
+        const actId = env.payload?.id; if(actId) { actionAcks.add(actId); highlightAck(actId); }
+      }
+      render();
     }
 
-    function handleComponent(component) {
-      components.set(component.id, component);
-      renderComponents();
+    function applySnapshot(snapshot){
+      if(snapshot && snapshot.component){
+        upsertComponent(snapshot.component);
+        snapshotInfo.style.display = '';
+        setTimeout(()=> snapshotInfo.style.display='none', 2500);
+      }
+      // Optionally process snapshot.actions here
     }
 
-    function renderComponents() {
+    function upsertComponent(comp){
+      // Defensive decode if content is serialized JSON
+      if(comp?.data?.content && typeof comp.data.content === 'string' && comp.data.content.trim().startsWith('{')){
+        try { comp.data.content = JSON.parse(comp.data.content); } catch {}
+      }
+      componentStore.set(comp.id, comp);
+    }
+
+    function highlightAck(actionId){
+      // placeholder: could visually show acked action; no-op for now
+      logDebug(`Acked action ${actionId}`);
+    }
+
+    // =============================
+    // Rendering
+    // =============================
+    function render(){
       componentsDiv.innerHTML = '';
-      if (components.size === 0) {
-        updateEmpty();
-        return;
-      }
-      updateEmpty();
-      for (const comp of components.values()) {
-        let el;
-        switch (comp.type) {
-          case 'CARD': el = renderCard(comp); break;
-          case 'NOTIFICATION': el = renderNotification(comp); break;
-          case 'FORM': el = renderForm(comp); break;
-          default: el = renderDefault(comp); break;
-        }
-        componentsDiv.appendChild(el);
+      if(componentStore.size === 0){ emptyDiv.style.display=''; return; } else { emptyDiv.style.display='none'; }
+      for(const comp of componentStore.values()){
+        componentsDiv.appendChild(renderComponent(comp));
       }
     }
 
-    function renderCard(comp) {
-      const d = comp.data || {};
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.innerHTML = `
-        <div class="card-title">${escapeHtml(d.title || 'Card')}</div>
-        <div class="card-subtitle">${escapeHtml(d.subtitle || '')}</div>
-        <div class="card-content">${escapeHtml(d.content || '')}</div>
-        ${Array.isArray(d.actions) ? renderActions(d.actions) : ''}
-      `;
-      return card;
+    function renderComponent(comp){
+      const wrap = document.createElement('div');
+      wrap.className = 'panel component-' + (comp.type || '').toLowerCase();
+      wrap.setAttribute('data-component-id', comp.id);
+      switch(comp.type){
+        case 'CARD': wrap.innerHTML = tplCard(comp); break;
+        case 'NOTIFICATION': wrap.innerHTML = tplNotification(comp); break;
+        case 'FORM': wrap.innerHTML = tplForm(comp); break;
+        default: wrap.innerHTML = tplDefault(comp); break;
+      }
+      return wrap;
     }
-    function renderNotification(comp) {
-      const d = comp.data || {};
-      const n = document.createElement('div');
-      n.className = 'notification ' + (d.type ? d.type.toLowerCase() : 'info');
-      const icons = { success: '✓', error: '✗', warning: '!', info: 'i' };
-      n.innerHTML = `
-        <div class="notification-header">
-          <span class="notification-icon">${icons[d.type?.toLowerCase()] || 'i'}</span>
-          <span class="notification-title">${escapeHtml(d.title || 'Notification')}</span>
-        </div>
-        <div class="notification-message">${escapeHtml(d.message || '')}</div>
-      `;
-      return n;
+
+    function tplCard(comp){
+      const d = comp.data || {}; const buttons = (d.buttons||[]).map((b,i)=>`<button class="btn secondary" onclick="sendAction('${comp.id}','CLICK',{ buttonIndex:${i}, text:${JSON.stringify(b.text||'')} })">${escapeHtml(b.text||'Action')}</button>`).join('');
+      const contentHtml = typeof d.content === 'object' ? `<pre>${escapeHtml(JSON.stringify(d.content,null,2))}</pre>` : escapeHtml(d.content || '');
+      return `<div class="card-title">${escapeHtml(d.title||'Card')}</div>
+              <div class="card-subtitle">${escapeHtml(d.subtitle||'')}</div>
+              <div class="card-content">${contentHtml}</div>
+              <div class="card-actions">${buttons}</div>
+              ${ruleEval(comp)}
+              ${meta(comp)}`;
     }
-    function renderForm(comp) {
-      const d = comp.data || {};
-      const f = document.createElement('div');
-      f.className = 'form';
-      f.innerHTML = `
-        <div class="form-title">${escapeHtml(d.title || 'Form')}</div>
-        <form>${renderFormFields(d.fields || [])}
-          <button type="submit" class="btn">${escapeHtml(d.submitText || 'Submit')}</button>
-        </form>
-      `;
-      f.querySelector('form').onsubmit = e => {
-        e.preventDefault();
-        alert('Form submitted!');
+
+    function tplNotification(comp){
+      const d = comp.data || {}; const t = (d.type||'info').toLowerCase();
+      return `<div class="notification ${t}">
+        <div class="notification-title">${escapeHtml(d.title||'Notification')}</div>
+        <div class="card-content">${escapeHtml(d.message||'')}</div>
+        ${ruleEval(comp)}
+        ${meta(comp)}
+      </div>`;
+    }
+
+    function tplForm(comp){
+      const d = comp.data || {}; const fields = (d.fields||[]).map(f=>fieldHtml(f)).join('');
+      return `<div class="form">
+        <div class="form-title">${escapeHtml(d.title||'Form')}</div>
+        <form onsubmit="handleFormSubmit(event,'${comp.id}')">${fields}<div style="margin-top:.5rem;"><button type="submit" class="btn">${escapeHtml(d.submitText||'Submit')}</button></div></form>
+        ${ruleEval(comp)}
+        ${meta(comp)}
+      </div>`;
+    }
+
+    function tplDefault(comp){
+      return `<div class="card-title">${escapeHtml(comp.type||'Unknown')}</div>
+              <div class="card-content"><pre>${escapeHtml(JSON.stringify(comp.data,null,2))}</pre></div>
+              ${ruleEval(comp)}
+              ${meta(comp)}`;
+    }
+
+    function fieldHtml(f){
+      switch(f.type){
+        case 'textarea': return `<div class="form-group"><label class="form-label">${escapeHtml(f.label||f.name)}</label><textarea name="${escapeHtml(f.name)}" class="form-textarea" ${f.required?'required':''}></textarea></div>`;
+        case 'select': return `<div class="form-group"><label class="form-label">${escapeHtml(f.label||f.name)}</label><select name="${escapeHtml(f.name)}" class="form-select" ${f.required?'required':''}>${(f.options||[]).map(o=>`<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join('')}</select></div>`;
+        default: return `<div class="form-group"><label class="form-label">${escapeHtml(f.label||f.name)}</label><input name="${escapeHtml(f.name)}" type="${escapeHtml(f.type||'text')}" class="form-input" ${f.required?'required':''}/></div>`;
+      }
+    }
+
+    function meta(comp){
+      return `<div class="component-meta"><span class="badge">${escapeHtml(comp.type||'')}</span><span>ID ${escapeHtml(comp.id.slice(0,8))}</span><span>${new Date(comp.createdAt||Date.now()).toLocaleTimeString()}</span></div>`;
+    }
+
+    function ruleEval(comp){
+      const r = comp?.data?._ruleEvaluation; if(!r) return '';
+      const facts = r.facts || {}; const factChips = Object.entries(facts).map(([k,v])=>`<span class="rule-fact">${escapeHtml(k)}: ${escapeHtml(typeof v === 'string' ? v : Array.isArray(v)? v.join(',') : JSON.stringify(v))}</span>`).join('');
+      return `<div class="rule-eval"><div class="rule-eval-header"><span class="rule-badge">RULE</span><span>${escapeHtml(r.rule || 'unknown')}</span><span style="margin-left:auto;font-size:.55rem;color:#64748b;">${escapeHtml(r.result||'')}</span></div><div class="rule-facts">${factChips}</div></div>`;
+    }
+
+    // =============================
+    // Action / Form Submission
+    // =============================
+    function sendAction(componentId, actionType, data){
+      const action = {
+        id: 'action-' + Date.now(),
+        componentId,
+        actionType,
+        data: Object.assign({ timestamp: new Date().toISOString() }, data||{}),
+        timestamp: new Date().toISOString()
       };
-      return f;
+      postAction(action);
     }
-    function renderFormFields(fields) {
-      return fields.map(field => {
-        switch (field.type) {
-          case 'text': case 'email': case 'password':
-            return `<div class="form-group"><label class="form-label">${escapeHtml(field.label)}</label><input type="${field.type}" name="${field.name}" class="form-input" placeholder="${escapeHtml(field.placeholder || '')}" ${field.required ? 'required' : ''}></div>`;
-          case 'textarea':
-            return `<div class="form-group"><label class="form-label">${escapeHtml(field.label)}</label><textarea name="${field.name}" class="form-input form-textarea" placeholder="${escapeHtml(field.placeholder || '')}" ${field.required ? 'required' : ''}></textarea></div>`;
-          case 'select':
-            return `<div class="form-group"><label class="form-label">${escapeHtml(field.label)}</label><select name="${field.name}" class="form-select" ${field.required ? 'required' : ''}>${(field.options||[]).map(opt => `<option value="${opt.value}">${escapeHtml(opt.label)}</option>`).join('')}</select></div>`;
-          default: return '';
-        }
-      }).join('');
+
+    function handleFormSubmit(evt, componentId){
+      evt.preventDefault();
+      const form = evt.target;
+      const data = {};
+      new FormData(form).forEach((v,k)=> data[k]=v);
+      sendAction(componentId,'SUBMIT', data);
+      form.reset();
     }
-    function renderActions(actions) {
-      return `<div class="card-actions">${actions.map(a => `<button class="btn" onclick="alert('Action: ${escapeHtml(a.action)}')">${escapeHtml(a.label)}</button>`).join('')}</div>`;
+
+    function postAction(action){
+      const envelope = {
+        direction: 'ACTION',
+        payload: action,
+        metadata: { acknowledged:false, correlationId: action.id, error:null }
+      };
+      fetch('http://localhost:3001/graphql', {
+        method:'POST', headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({
+          query: 'mutation($m:String!){sendMessage(message:$m)}',
+            variables: { m: JSON.stringify(envelope) }
+        })
+      }).then(r=>r.json()).then(res=>logDebug(['action result',res])).catch(err=>logDebug(['action error', String(err)]));
     }
-    function renderDefault(comp) {
-      const d = comp.data || {};
-      const el = document.createElement('div');
-      el.className = 'card';
-      el.innerHTML = `<div class="card-title">${escapeHtml(comp.type)}</div><div class="card-content">${escapeHtml(JSON.stringify(d))}</div>`;
-      return el;
-    }
-    function escapeHtml(str) {
-      return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
+
+    function escapeHtml(str){ return String(str).replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;' }[c])); }
+
+    // Kick off
     connect();
   </script>
 </body>
 </html>
-    </div>
-</div>
-
-<script>
-    // ========================
-    // COMPONENT RENDERER CLASS
-    // ========================
-    class ComponentRenderer {
-        constructor() {
-            this.ws = null;
-            this.components = new Map();
-    // ========================
-    // COMPONENT RENDERER CLASS
-    // ========================
-    class ComponentRenderer {
-        constructor() {
-            this.ws = null;
-            this.components = new Map();
-            this.reconnectAttempts = 0;
-            this.maxReconnectAttempts = 10;
-            this.reconnectDelay = 1000;
-            this.elements = {
-                statusBar: document.getElementById('statusBar'),
-                statusDot: document.getElementById('statusDot'),
-                statusText: document.getElementById('statusText'),
-                loadingState: document.getElementById('loadingState'),
-                componentsGrid: document.getElementById('componentsGrid'),
-                emptyState: document.getElementById('emptyState')
-            };
-            this.connect();
-        }
-        connect() {
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            const wsUrl = `${proto}://${window.location.hostname}:3001/graphql`;
-            this.updateStatus('connecting', 'Connecting...');
-            this.ws = new WebSocket(wsUrl, 'graphql-ws');
-            this.ws.onopen = () => {
-                this.updateStatus('connected', 'Connected');
-                this.reconnectAttempts = 0;
-                this.hideLoading();
-                this.ws.send(JSON.stringify({ type: 'connection_init' }));
-            };
-            this.ws.onmessage = (event) => {
-                try {
-                    const message = JSON.parse(event.data);
-                    this.handleMessage(message);
-                } catch (e) {
-                    console.error('Malformed message:', event.data);
-                }
-            };
-            this.ws.onclose = () => {
-                this.updateStatus('disconnected', 'Disconnected');
-                this.showLoading();
-                this.attemptReconnect();
-            };
-            this.ws.onerror = () => {
-                this.updateStatus('disconnected', 'Connection Error');
-            };
-        }
-        handleMessage(message) {
-            switch (message.type) {
-                case 'connection_ack':
-                    this.startSubscription();
-                    break;
-                case 'data':
-                    if (message.payload?.data?.rendererUpdate) {
-                        this.handleComponentUpdate(message.payload.data.rendererUpdate);
-                    }
-                    break;
-                case 'error':
-                    this.updateStatus('disconnected', 'GraphQL Error');
-                    break;
-            }
-        }
-        startSubscription() {
-            this.ws.send(JSON.stringify({
-                id: 'component-subscription',
-                type: 'start',
-                payload: {
-                    query: `
-                        subscription {
-                            rendererUpdate {
-                                id
-                                type
-                                data
-                                createdAt
-                            }
-                        }
-                    `
-                }
-            }));
-        }
-                            rendererUpdate {
-                                id
-                                type
-                                data
-                                createdAt
-                            }
-                        }
-                    `
-                }
-            }));
-        }
-        startSubscription() {
-            this.ws.send(JSON.stringify({
-                id: 'component-subscription',
-                type: 'start',
-                payload: {
-                    query: `
-                        subscription {
-                            rendererUpdate {
-                                id
-                                type
-                                data
-                                createdAt
-                            }
-                        }
-                    `
-                }
-            }));
-        }
-        handleComponentUpdate(component) {
-            const id = component.id;
-            const existing = this.components.get(id);
-            if (existing) {
-                this.updateComponent(component);
-            } else {
-                this.addComponent(component);
-            }
-            this.components.set(id, component);
-            this.updateEmptyState();
-        }
-        addComponent(component) {
-            const element = this.createComponentElement(component);
-            this.elements.componentsGrid.appendChild(element);
-        }
-        updateComponent(component) {
-            const element = document.querySelector(`[data-component-id="${component.id}"]`);
-            if (element) {
-                element.classList.add('updating');
-                setTimeout(() => element.classList.remove('updating'), 600);
-                const newElement = this.createComponentElement(component);
-                element.innerHTML = newElement.innerHTML;
-            }
-        }
-        createComponentElement(component) {
-            const element = document.createElement('div');
-            element.className = `component ${String(component.type).toLowerCase()}`;
-            element.setAttribute('data-component-id', component.id);
-            switch (component.type) {
-                case 'CARD':
-                    element.innerHTML = this.renderCard(component);
-                    break;
-                case 'NOTIFICATION':
-                    element.innerHTML = this.renderNotification(component);
-                    break;
-                case 'FORM':
-                    element.innerHTML = this.renderForm(component);
-                    break;
-                default:
-                    element.innerHTML = this.renderDefault(component);
-            }
-            return element;
-        }
-        renderCard(component) {
-            const data = component.data || {};
-            return `
-                <div class="card">
-                    <div class="card-header">
-                        <div class="card-title">${this.escapeHtml(data.title || 'Card Title')}</div>
-                        <div class="card-subtitle">${this.escapeHtml(data.subtitle || '')}</div>
-                    </div>
-                    <div class="card-body">
-                        <div class="card-content">
-                            ${this.escapeHtml(data.content || 'Card content goes here...')}
-                        </div>
-                        ${data.actions ? this.renderActions(data.actions) : ''}
-                    </div>
-                    ${this.renderComponentMeta(component)}
-                </div>
-            `;
-        }
-        renderNotification(component) {
-            const data = component.data || {};
-            const type = (data.type || 'info').toLowerCase();
-            const icons = { success: '✓', error: '✗', warning: '!', info: 'i' };
-            return `
-                <div class="notification ${type}">
-                    <div class="notification-header">
-                        <div class="notification-icon">${icons[type] || 'i'}</div>
-                        <div class="notification-title">${this.escapeHtml(data.title || 'Notification')}</div>
-                    </div>
-                    <div class="notification-message">
-                        ${this.escapeHtml(data.message || 'Notification message')}
-                    </div>
-                    ${this.renderComponentMeta(component)}
-                </div>
-            `;
-        }
-        renderForm(component) {
-            const data = component.data || {};
-            return `
-                <div class="form">
-                    <div class="form-title">${this.escapeHtml(data.title || 'Form')}</div>
-                    <form onsubmit="renderer.handleFormSubmit(event, '${component.id}')">
-                        ${this.renderFormFields(data.fields || [])}
-                        <button type="submit" class="btn btn-primary">
-                            ${this.escapeHtml(data.submitText || 'Submit')}
-                        </button>
-                    </form>
-                    ${this.renderComponentMeta(component)}
-                </div>
-            `;
-        }
-        renderFormFields(fields) {
-            return fields.map(field => {
-                switch (field.type) {
-                    case 'text':
-                    case 'email':
-                    case 'password':
-                        return `
-                            <div class="form-group">
-                                <label class="form-label">${this.escapeHtml(field.label)}</label>
-                                <input 
-                                    type="${field.type}" 
-                                    name="${field.name}"
-                                    class="form-input" 
-                                    placeholder="${this.escapeHtml(field.placeholder || '')}"
-                                    ${field.required ? 'required' : ''}
-                                >
-                            </div>
-                        `;
-                    case 'textarea':
-                        return `
-                            <div class="form-group">
-                                <label class="form-label">${this.escapeHtml(field.label)}</label>
-                                <textarea 
-                                    name="${field.name}"
-                                    class="form-input form-textarea" 
-                                    placeholder="${this.escapeHtml(field.placeholder || '')}"
-                                    ${field.required ? 'required' : ''}
-                                ></textarea>
-                            </div>
-                        `;
-                    case 'select':
-                        return `
-                            <div class="form-group">
-                                <label class="form-label">${this.escapeHtml(field.label)}</label>
-                                <select name="${field.name}" class="form-select" ${field.required ? 'required' : ''}>
-                                    ${(field.options || []).map(opt => 
-                                        `<option value="${opt.value}">${this.escapeHtml(opt.label)}</option>`
-                                    ).join('')}
-                                </select>
-                            </div>
-                        `;
-                    default:
-                        return '';
-                }
-            }).join('');
-        }
-        renderActions(actions) {
-            return `
-                <div class="card-actions">
-                    ${actions.map(action => `
-                        <button 
-                            class="btn btn-${action.style || 'primary'}"
-                            onclick="renderer.handleAction('${action.id}', '${action.action}')"
-                        >
-    // (removed duplicate class definition)
-    document.addEventListener('DOMContentLoaded', () => {
-        renderer = new ComponentRenderer();
-    });
-    document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && renderer && (!renderer.ws || renderer.ws.readyState !== WebSocket.OPEN)) {
-            renderer.connect();
-        }
-    });

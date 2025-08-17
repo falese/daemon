@@ -92,7 +92,22 @@ class ComponentRegistry {
       if (conditionResult) {
         triggered = true;
         console.log(`✨ Registry: Rule '${ruleName}' triggered`);
-        const componentSpec = rule.generate(state, action);
+        const componentSpec = rule.generate(state, action) || {};
+        // Attach rule evaluation metadata into component data (namespaced)
+        componentSpec.data = Object.assign({}, componentSpec.data || {}, {
+          _ruleEvaluation: {
+            rule: ruleName,
+            facts: {
+              componentId: state.component.id,
+              componentType: state.component.type,
+              actionId: action.id,
+              actionType: action.actionType,
+              actionDataKeys: Object.keys(action.data || {})
+            },
+            result: 'TRIGGERED',
+            timestamp: new Date().toISOString()
+          }
+        });
         await this.renderComponent(componentSpec);
       }
     }

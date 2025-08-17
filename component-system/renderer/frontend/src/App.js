@@ -76,6 +76,7 @@ class GraphQLWebSocketClient {
   handleMessage(message) {
     console.log('📨 Renderer: Raw message from daemon:', message);
 
+    // Accept both legacy 'data' and new 'next'
     switch (message.type) {
       case 'connection_ack':
         console.log('📡 Renderer: Connection acknowledged');
@@ -84,28 +85,15 @@ class GraphQLWebSocketClient {
         break;
 
       case 'data':
-        console.log('📨 Renderer: Data message received:', message);
-        // Handle subscription data
-        if (message.payload?.data?.messages) {
-          const msg = message.payload.data.messages;
-          console.log(`📦 Renderer: Received ${msg.direction} message:`, msg);
-
-          // Debug: log all registered directions and the incoming direction
-          console.log('[Renderer] Registered directions:', Array.from(this.messageHandlers.keys()));
-          console.log('[Renderer] Incoming direction:', msg.direction, typeof msg.direction, JSON.stringify(msg.direction));
-
-          // Route message to appropriate handler
-          const handlers = this.messageHandlers.get(msg.direction) || [];
-          if (handlers.size !== undefined) {
-            // Set
-            handlers.forEach(handler => handler(msg));
-          } else {
-            // Array fallback
-            handlers.forEach(handler => handler(msg));
-          }
+      case 'next': {
+        const container = message.payload?.data?.messages;
+        if (container) {
+          const handlers = this.messageHandlers.get(container.direction) || [];
+            (handlers.size !== undefined ? handlers : new Set(handlers)).forEach(h => h(container));
         }
         break;
-        
+      }
+      
       case 'error':
         console.error('❌ Renderer: GraphQL error:', message.payload);
         break;
@@ -121,8 +109,6 @@ class GraphQLWebSocketClient {
 
   startSubscription() {
     const subscriptionId = 'renderer-subscription';
-    
-    // GraphQL subscription query for messages
     const subscription = {
       id: subscriptionId,
       type: 'start',
@@ -131,18 +117,14 @@ class GraphQLWebSocketClient {
           subscription {
             messages {
               direction
+              kind
               payload
-              metadata {
-                acknowledged
-                correlationId
-                error
-              }
+              metadata { acknowledged correlationId error }
             }
           }
         `
       }
     };
-
     this.send(subscription);
     console.log('📡 Renderer: Started subscription to daemon');
   }
@@ -228,15 +210,20 @@ class ComponentDisplaySystem {
     this.componentStates = new Map();
     this.subscribers = new Set();
     this.messageHandlerCleanups = new Set();
+    this.actions = [];
   }
 
   async connect() {
     try {
-      // Register handler BEFORE connecting, so no messages are missed
+      // Register handlers BEFORE connect
       const componentHandler = this.graphqlClient.onMessage('COMPONENT', (message) => {
-        this.handleComponentMessage(message);
+        this.handleComponentEnvelope(message);
+      });
+      const actionHandler = this.graphqlClient.onMessage('ACTION', (message) => {
+        this.handleActionEnvelope(message);
       });
       this.messageHandlerCleanups.add(componentHandler);
+      this.messageHandlerCleanups.add(actionHandler);
 
       await this.graphqlClient.connect();
       this.notify({ type: 'connected' });
@@ -254,38 +241,62 @@ class ComponentDisplaySystem {
     this.notify({ type: 'disconnected' });
   }
 
-  handleComponentMessage(message) {
-    console.log(`📦 Renderer: Received component message:`, message);
-    const component = message.payload;
-    console.debug('[Debug] handleComponentMessage: component:', component);
-    this.components.set(component.id, component);
-
-    // Initialize or update component state
-    if (!this.componentStates.has(component.id)) {
+  handleComponentEnvelope(message) {
+    const kind = message.kind;
+    // STATE_SNAPSHOT carries { component, actions, lastUpdated }
+    if (kind === 'STATE_SNAPSHOT' && message.payload?.component) {
+      const snap = message.payload;
+      const component = snap.component;
+      if (!component?.id || !component?.type) return; // ignore malformed
+      this.components.set(component.id, component);
       this.componentStates.set(component.id, {
         component,
-        actions: [],
-        lastUpdated: new Date().toISOString()
+        actions: snap.actions || [],
+        lastUpdated: snap.lastUpdated || new Date().toISOString()
       });
+      this.notify({ type: 'components_changed' });
+      return;
     }
-
-    // Debug: log all components after update
-    console.debug('[Debug] handleComponentMessage: all components:', Array.from(this.components.values()));
-
-    this.notify({ type: 'components_changed' });
-
-    // Handle auto-removal if specified
-    if (component.data?.autoRemove) {
-      setTimeout(() => {
-        this.removeComponent(component.id);
-      }, component.data.autoRemove);
+    // COMPONENT_UPDATE carries the component directly
+    if (kind === 'COMPONENT_UPDATE') {
+      const component = message.payload;
+      if (!component?.id || !component?.type) return;
+      this.components.set(component.id, component);
+      if (!this.componentStates.has(component.id)) {
+        this.componentStates.set(component.id, { component, actions: [], lastUpdated: new Date().toISOString() });
+      } else {
+        const st = this.componentStates.get(component.id);
+        st.component = component;
+        st.lastUpdated = new Date().toISOString();
+      }
+      this.notify({ type: 'components_changed' });
+      return;
+    }
+    // Fallback: if payload looks like a component
+    if (message.payload?.id && message.payload?.type) {
+      const component = message.payload;
+      this.components.set(component.id, component);
+      if (!this.componentStates.has(component.id)) {
+        this.componentStates.set(component.id, { component, actions: [], lastUpdated: new Date().toISOString() });
+      }
+      this.notify({ type: 'components_changed' });
     }
   }
 
-  removeComponent(componentId) {
-    this.components.delete(componentId);
-    this.componentStates.delete(componentId);
-    this.notify({ type: 'components_changed' });
+  handleActionEnvelope(message) {
+    if (message.kind === 'ACTION_ECHO') {
+      this.actions.unshift(message.payload); // newest first
+      this.actions = this.actions.slice(0, 50); // cap
+      // Attach action to component state if exists
+      const compId = message.payload?.componentId;
+      if (compId && this.componentStates.has(compId)) {
+        const st = this.componentStates.get(compId);
+        st.actions.push(message.payload);
+        st.lastUpdated = new Date().toISOString();
+      }
+      this.notify({ type: 'actions_changed' });
+      this.notify({ type: 'components_changed' }); // to update counts
+    }
   }
 
   sendAction(componentId, actionType, data) {
@@ -296,20 +307,15 @@ class ComponentDisplaySystem {
       data,
       timestamp: new Date().toISOString()
     };
-
     const message = {
       direction: 'ACTION',
       payload: action,
-      metadata: {
-        acknowledged: false,
-        correlationId: `${action.id}`,
-        error: null
-      }
+      metadata: { acknowledged: false, correlationId: action.id, error: null }
     };
-
-    // Send the action using the GraphQL mutation
     this.graphqlClient.sendMessage(message);
   }
+
+  getRecentActions() { return this.actions; }
 
   subscribe(callback) {
     this.subscribers.add(callback);
@@ -324,6 +330,36 @@ class ComponentDisplaySystem {
     return Array.from(this.components.values());
   }
 }
+
+// ========================
+// RULE EVALUATION BADGE
+// ========================
+const RuleEvaluation = ({ evalData }) => {
+  if (!evalData) return null;
+  const { rule, facts = {}, result } = evalData;
+  const formatVal = (v) => {
+    if (v == null) return 'null';
+    if (Array.isArray(v)) return v.join(',');
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  };
+  return (
+    <div className="mt-3 bg-blue-50 border border-blue-200 rounded p-2">
+      <div className="flex items-center text-[10px] font-semibold tracking-wide text-blue-700 uppercase">
+        <span className="px-1.5 py-0.5 bg-blue-600 text-white rounded mr-2">RULE</span>
+        <span>{rule || 'unknown'}</span>
+        {result && <span className="ml-auto text-blue-400">{result}</span>}
+      </div>
+      <div className="mt-1 flex flex-wrap gap-1">
+        {Object.entries(facts).map(([k, v]) => (
+          <span key={k} className="text-[10px] bg-white border border-blue-200 rounded-full px-2 py-0.5">
+            {k}: {formatVal(v)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 // ========================
 // UI COMPONENT RENDERERS
@@ -357,6 +393,7 @@ const UIRenderers = {
           ))}
         </div>
       )}
+      <RuleEvaluation evalData={data._ruleEvaluation} />
     </div>
   ),
 
@@ -372,18 +409,17 @@ const UIRenderers = {
       <div className={`max-w-sm mx-auto border rounded p-4 mb-4 ${bgColor}`}>
         {data.title && <h3 className="font-bold mb-1">{data.title}</h3>}
         <p>{data.message}</p>
+        <RuleEvaluation evalData={data._ruleEvaluation} />
       </div>
     );
   },
 
   FORM: ({ data, componentId, onAction }) => {
     const [formData, setFormData] = React.useState({});
-    
     const handleSubmit = (e) => {
       e.preventDefault();
       onAction(componentId, 'SUBMIT', formData);
     };
-
     return (
       <form onSubmit={handleSubmit} className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4">
         {data.title && (
@@ -413,6 +449,7 @@ const UIRenderers = {
         >
           {data.submitText || 'Submit'}
         </button>
+        <RuleEvaluation evalData={data._ruleEvaluation} />
       </form>
     );
   }
@@ -427,7 +464,8 @@ const useComponentDisplay = () => {
   const [state, setState] = useState({
     components: [],
     connected: false,
-    error: null
+    error: null,
+    actions: []
   });
 
   const handleAction = useCallback((componentId, actionType, data) => {
@@ -437,8 +475,10 @@ const useComponentDisplay = () => {
 
   useEffect(() => {
     const unsubscribe = singletonDisplaySystem.subscribe((event) => {
-      console.log('[Renderer] Event from display system:', event);
       switch (event.type) {
+        case 'actions_changed':
+          setState(prev => ({ ...prev, actions: singletonDisplaySystem.getRecentActions() }));
+          break;
         case 'connected':
           setState(prev => ({ ...prev, connected: true, error: null }));
           break;
@@ -453,13 +493,10 @@ const useComponentDisplay = () => {
           }));
           break;
         case 'components_changed':
-          const comps = singletonDisplaySystem.getComponents();
-          console.log('[Renderer] components_changed, new components:', comps);
-          // Extra debug: log each component
-          comps.forEach((c, i) => console.debug(`[Debug] components_changed: component[${i}]:`, c));
-          setState(prev => ({ 
-            ...prev, 
-            components: comps
+          setState(prev => ({
+            ...prev,
+            components: singletonDisplaySystem.getComponents(),
+            actions: singletonDisplaySystem.getRecentActions()
           }));
           break;
       }
@@ -483,7 +520,7 @@ const useComponentDisplay = () => {
 // ========================
 
 export default function RealComponentRenderer() {
-  const { components, connected, error, onAction } = useComponentDisplay();
+  const { components, connected, error, onAction, actions } = useComponentDisplay();
 
   const renderComponent = useCallback((component) => {
     const Renderer = UIRenderers[component.type];
@@ -562,40 +599,10 @@ export default function RealComponentRenderer() {
 
         {/* Components from Daemon */}
         <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-gray-900">
-            Components from Daemon: ({components.length})
-          </h3>
-          
-          {!connected && !error && (
-            <div className="text-center py-8 text-gray-500 bg-white rounded-lg">
-              <div className="animate-spin w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
-              Connecting to daemon...
-            </div>
-          )}
-
-          {connected && components.length === 0 && (
-            <div className="text-center py-8 text-gray-500 bg-white rounded-lg">
-              Connected! Waiting for components from daemon...
-              <div className="mt-4 text-xs text-gray-400">
-                Try sending a component via the registry
-              </div>
-            </div>
-          )}
-
+          <h3 className="text-lg font-semibold text-gray-900">Components from Daemon: ({components.length})</h3>
           {components.map(component => {
             const ComponentRenderer = UIRenderers[component.type];
-            
-            if (!ComponentRenderer) {
-              return (
-                <div key={component.id} className="bg-red-100 border border-red-400 rounded p-4">
-                  <p className="text-red-700">Unknown component type: {component.type}</p>
-                  <pre className="text-xs mt-2 text-red-600">
-                    {JSON.stringify(component, null, 2)}
-                  </pre>
-                </div>
-              );
-            }
-
+            if (!ComponentRenderer) return null; // silently skip unknown now
             return (
               <div key={component.id} data-component-id={component.id}>
                 <ComponentRenderer
@@ -607,6 +614,19 @@ export default function RealComponentRenderer() {
             );
           })}
         </div>
+        {actions?.length > 0 && (
+          <details className="mt-8 bg-white rounded p-4">
+            <summary className="cursor-pointer font-medium">Recent Actions ({actions.length})</summary>
+            <ul className="mt-3 space-y-2 text-xs font-mono">
+              {actions.map(a => (
+                <li key={a.id} className="border border-gray-200 rounded p-2 bg-gray-50">
+                  <div className="flex justify-between"><span>{a.actionType}</span><span className="text-gray-400">{a.id}</span></div>
+                  <pre className="mt-1 text-[10px] whitespace-pre-wrap">{JSON.stringify(a.data, null, 2)}</pre>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
 
         {/* Debug */}
         {components.length > 0 && (
