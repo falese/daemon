@@ -18,7 +18,7 @@ A distributed, real-time component rendering system built with GraphQL, Rust, No
 │                 │                   │                 │     & Actions     │                 │
 │  • Manages      │                   │  • Maintains    │                   │  • Renders UI   │
 │    Components   │    Components     │    State        │                   │  • Handles      │
-│  • Rules Engine │─────────────────► │  • Message      │                   │    User Input  │
+│  • Rules Engine │─────────────────► │  • Message      │                   │    User Input   │
 │  • REST API     │                   │    Router       │                   │  • Processes    │
 │  • GraphQL      │                   │  • State        │                   │    Actions      │
 │    Publishing   │                   │    Machine      │                   │                 │
