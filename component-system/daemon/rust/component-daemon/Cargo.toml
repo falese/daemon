@@ -17,7 +17,7 @@ async-graphql-warp = "5.0"
 warp = "0.3"
 url = "2.4"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 dashmap = "5.5"
 async-stream = "0.3"

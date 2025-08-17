@@ -1,7 +1,6 @@
 use std::convert::Infallible;
 use std::time::Duration;
 use std::sync::Arc;
-use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use async_graphql::*;
@@ -12,14 +11,73 @@ use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 use warp::Filter;
 use uuid::Uuid;
+use futures_util::Stream;
+
+// ========================
+// GRAPHQL SCHEMA
+// ========================
+
+struct Query;
+
+#[Object]
+impl Query {
+    async fn health(&self) -> bool {
+        true
+    }
+}
+
+struct Mutation;
+
+#[Object]
+impl Mutation {
+    async fn send_message(&self, ctx: &async_graphql::Context<'_>, message: String) -> Result<bool> {
+        let daemon = ctx.data_unchecked::<ComponentDaemon>();
+        let msg: DaemonMessage = serde_json::from_str(&message)?;
+        daemon.handle_message(msg).await?;
+        Ok(true)
+    }
+}
+
+struct Subscription;
+
+#[Subscription]
+impl Subscription {
+    async fn messages(&self, ctx: &async_graphql::Context<'_>) -> impl Stream<Item = DaemonMessage> {
+        let daemon = ctx.data_unchecked::<ComponentDaemon>();
+        daemon.subscribe().await
+    }
+}
 
 // ========================
 // TYPES
 // ========================
+
+#[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonMessage {
+    pub direction: MessageDirection,
+    pub payload: serde_json::Value,
+    pub metadata: Option<MessageMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Enum, Copy, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MessageDirection {
+    Component,
+    Action,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageMetadata {
+    pub acknowledged: bool,
+    pub correlation_id: Option<String>,
+    pub error: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +88,16 @@ pub struct Component {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
+#[serde(rename_all = "camelCase")]
+pub struct Action {
+    pub id: String,
+    pub component_id: String,
+    pub action_type: String,
+    pub data: serde_json::Value,
+    pub timestamp: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Enum, Copy, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ComponentType {
@@ -38,7 +106,16 @@ pub enum ComponentType {
     Form,
 }
 
+// ========================
+// STATE MANAGEMENT
+// ========================
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ComponentState {
+    pub component: Component,
+    pub actions: Vec<Action>,
+    pub last_updated: DateTime<Utc>,
+}
 
 // ========================
 // DAEMON
@@ -46,9 +123,9 @@ pub enum ComponentType {
 
 #[derive(Clone)]
 pub struct ComponentDaemon {
-    components: Arc<DashMap<String, Component>>,
+    components: Arc<DashMap<String, ComponentState>>,
     all_components: Arc<tokio::sync::Mutex<Vec<Component>>>,
-    broadcast_tx: broadcast::Sender<Component>,
+    broadcast_tx: broadcast::Sender<DaemonMessage>,
 }
 
 impl ComponentDaemon {
@@ -61,14 +138,204 @@ impl ComponentDaemon {
         }
     }
 
-    pub async fn start(&self) -> Result<()> {
-        let daemon = self.clone();
-        tokio::spawn(async move {
-            daemon.connect_to_registry().await;
-        });
+    /// Gets the raw components map with states
+    pub fn get_component_states_map(&self) -> Arc<DashMap<String, ComponentState>> {
+        self.components.clone()
+    }
 
-        info!("🚀 Daemon: Started");
-        Ok(())
+    /// Gets a list of all components currently in the daemon.
+    /// This returns the components themselves, without their associated actions and state.
+    pub fn get_components(&self) -> Vec<Component> {
+        self.components.iter()
+            .map(|entry| entry.value().component.clone())
+            .collect()
+    }
+    
+    /// Gets a list of all component states, including components and their actions
+    pub fn get_component_states(&self) -> Vec<ComponentState> {
+        self.components.iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub async fn get_all_components_count(&self) -> usize {
+        self.all_components.lock().await.len()
+    }
+
+    pub async fn handle_message(&self, message: DaemonMessage) -> Result<Option<DaemonMessage>> {
+        match message.direction {
+            MessageDirection::Action => {
+                info!("[Daemon] Received ACTION message: {:?}", message);
+                self.handle_action(message).await
+            },
+            MessageDirection::Component => {
+                info!("[Daemon] Received COMPONENT message: {:?}", message);
+                self.handle_component(message).await
+            },
+        }
+    }
+
+    async fn handle_action(&self, message: DaemonMessage) -> Result<Option<DaemonMessage>> {
+        let action: Action = serde_json::from_value(message.payload.clone())?;
+        info!("[Daemon] Storing action for component {}: {:?}", action.component_id, action);
+        // Update component state
+        if let Some(mut state) = self.components.get_mut(&action.component_id) {
+            state.actions.push(action.clone());
+            state.last_updated = Utc::now();
+            info!("[Daemon] Updated state for component {}: now has {} actions", action.component_id, state.actions.len());
+            // Send state update to registry
+            let state_message = DaemonMessage {
+                direction: MessageDirection::Component,
+                payload: serde_json::to_value(&*state)?,
+                metadata: Some(MessageMetadata {
+                    acknowledged: false,
+                    correlation_id: Some(Uuid::new_v4().to_string()),
+                    error: None,
+                }),
+            };
+            let _ = self.broadcast_tx.send(state_message.clone());
+
+            // --- NEW: Send handleMessage mutation over WebSocket to registry ---
+            // This is a fire-and-forget; errors are logged but do not block
+            let registry_host = std::env::var("REGISTRY_HOST").unwrap_or_else(|_| "registry".to_string());
+            let registry_port = std::env::var("REGISTRY_PORT").unwrap_or_else(|_| "4000".to_string());
+            let url = format!("ws://{registry_host}:{registry_port}/graphql");
+            let message_json = serde_json::to_string(&message).unwrap_or_default();
+            let mutation = "mutation handleMessage($message: String!) { handleMessage(message: $message) }".to_string();
+            let payload = serde_json::json!({
+                "id": format!("mutation-{}", Uuid::new_v4()),
+                "type": "subscribe",
+                "payload": {
+                    "query": mutation,
+                    "variables": { "message": message_json }
+                }
+            });
+            // Spawn a task to send the mutation over WebSocket
+            tokio::spawn(async move {
+                use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+                // Build request with correct subprotocol
+                let mut request = match url.clone().into_client_request() {
+                    Ok(r) => r,
+                    Err(e) => { tracing::error!("[Daemon] Mutation WS build request error: {}", e); return; }
+                };
+                if let Ok(hdr_val) = "graphql-transport-ws".parse() { request.headers_mut().append("Sec-WebSocket-Protocol", hdr_val); }
+                match connect_async(request).await {
+                    Ok((mut ws, _)) => {
+                        tracing::info!("[Daemon] Mutation WS connected for handleMessage");
+                        // Send connection_init
+                        let _ = ws.send(WsMessage::Text(serde_json::json!({"type": "connection_init"}).to_string())).await;
+                        tracing::info!("[Daemon] Mutation WS sent connection_init, awaiting connection_ack before sending mutation");
+
+                        // Wait for connection_ack before sending mutation (spec requirement)
+                        let mut acked = false;
+                        let start_wait = std::time::Instant::now();
+                        while start_wait.elapsed() < Duration::from_secs(2) {
+                            match tokio::time::timeout(Duration::from_millis(400), ws.next()).await {
+                                Ok(Some(Ok(evt))) => match evt {
+                                    WsMessage::Text(txt) => {
+                                        tracing::info!("[Daemon] Mutation WS pre-ack received: {}", txt);
+                                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                            if val.get("type").and_then(|v| v.as_str()) == Some("connection_ack") {
+                                                acked = true;
+                                                break;
+                                            }
+                                            // respond to ping if any before ack
+                                            if val.get("type").and_then(|v| v.as_str()) == Some("ping") {
+                                                let _ = ws.send(WsMessage::Text(serde_json::json!({"type":"pong"}).to_string())).await;
+                                            }
+                                        }
+                                    }
+                                    WsMessage::Ping(d) => { let _ = ws.send(WsMessage::Pong(d)).await; }
+                                    WsMessage::Close(cf) => { tracing::warn!("[Daemon] Mutation WS closed before ack: {:?}", cf); break; }
+                                    WsMessage::Pong(_) => {}
+                                    other => { tracing::info!("[Daemon] Mutation WS other pre-ack frame: {:?}", other); }
+                                },
+                                Ok(Some(Err(e))) => { tracing::error!("[Daemon] Mutation WS error waiting for ack: {}", e); break; }
+                                Ok(None) => { break; }
+                                Err(_) => { /* per-iteration timeout */ }
+                            }
+                        }
+                        if !acked {
+                            tracing::error!("[Daemon] Mutation WS did not receive connection_ack in time; aborting mutation send");
+                            let _ = ws.close(None).await;
+                            return;
+                        }
+
+                        // Send mutation after ack
+                        tracing::info!("[Daemon] Sending handleMessage mutation over WS (after ack): {}", payload);
+                        if let Err(e) = ws.send(WsMessage::Text(payload.to_string())).await { tracing::error!("[Daemon] Failed to send mutation subscribe: {}", e); }
+
+                        // Wait for next/complete or timeout
+                        let mut done = false;
+                        let start = std::time::Instant::now();
+                        while start.elapsed() < Duration::from_secs(3) {
+                            match tokio::time::timeout(Duration::from_millis(400), ws.next()).await {
+                                Ok(Some(Ok(evt))) => {
+                                    match evt {
+                                        WsMessage::Text(txt) => {
+                                            tracing::info!("[Daemon] Mutation WS received: {}", txt);
+                                            if txt.contains("\"type\":\"complete\"") || txt.contains("\"complete\"") { done = true; break; }
+                                        }
+                                        WsMessage::Close(cf) => { tracing::info!("[Daemon] Mutation WS close frame: {:?}", cf); break; }
+                                        WsMessage::Ping(d) => { let _ = ws.send(WsMessage::Pong(d)).await; }
+                                        WsMessage::Pong(_) => {}
+                                        other => { tracing::info!("[Daemon] Mutation WS other frame: {:?}", other); }
+                                    }
+                                }
+                                Ok(Some(Err(e))) => { tracing::error!("[Daemon] Mutation WS error: {}", e); break; }
+                                Ok(None) => { break; }
+                                Err(_) => { /* per-iteration timeout */ }
+                            }
+                        }
+                        if !done { tracing::info!("[Daemon] Mutation WS closing (timeout or no complete)"); }
+                        let _ = ws.close(None).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("[Daemon] Failed to connect to registry WebSocket for mutation: {}", e);
+                    }
+                }
+            });
+            // --- END NEW ---
+
+            Ok(Some(state_message))
+        } else {
+            warn!("[Daemon] Tried to store action for unknown component: {}", action.component_id);
+            Ok(None)
+        }
+    }
+
+    async fn handle_component(&self, message: DaemonMessage) -> Result<Option<DaemonMessage>> {
+        let component: Component = serde_json::from_value(message.payload.clone())?;
+        info!("[Daemon] Storing/Updating component: {}", component.id);
+        // Create or update component state
+        let state = ComponentState {
+            component: component.clone(),
+            actions: Vec::new(),
+            last_updated: Utc::now(),
+        };
+        self.components.insert(component.id.clone(), state);
+        info!("[Daemon] Component {} stored/updated", component.id);
+        // Forward to renderers
+        let forward_message = DaemonMessage {
+            direction: MessageDirection::Component,
+            payload: message.payload,
+            metadata: Some(MessageMetadata {
+                acknowledged: false,
+                correlation_id: Some(Uuid::new_v4().to_string()),
+                error: None,
+            }),
+        };
+        let _ = self.broadcast_tx.send(forward_message.clone());
+        Ok(Some(forward_message))
+    }
+
+    pub async fn subscribe(&self) -> impl Stream<Item = DaemonMessage> {
+        let mut rx = self.broadcast_tx.subscribe();
+        stream! {
+            while let Ok(msg) = rx.recv().await {
+                yield msg;
+            }
+        }
     }
 
     pub async fn connect_to_registry(&self) {
@@ -88,129 +355,95 @@ impl ComponentDaemon {
         }
     }
 
+    pub async fn start(&self) -> Result<()> {
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            daemon.connect_to_registry().await;
+        });
+        info!("🚀 Daemon: Started");
+        Ok(())
+    }
+
     async fn try_connect_to_registry(&self) -> Result<()> {
         let registry_host = std::env::var("REGISTRY_HOST").unwrap_or_else(|_| "registry".to_string());
         let registry_port = std::env::var("REGISTRY_PORT").unwrap_or_else(|_| "4000".to_string());
         let url = format!("ws://{registry_host}:{registry_port}/graphql");
-        
         info!("🔌 Daemon: Attempting to connect to {}", url);
-        
-        // Try the exact approach that works with your Node.js setup
         use tokio_tungstenite::tungstenite;
-        
-        let request = tungstenite::http::Request::builder()
-            .uri(&url)
-            .header("Host", format!("{registry_host}:{registry_port}"))
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
-            .header("Sec-WebSocket-Protocol", "graphql-ws")
-            .body(())?;
-            
-        info!("🔌 Daemon: Built WebSocket request with graphql-ws protocol");
-        
-        match connect_async(request).await {
-            Ok((ws_stream, response)) => {
-                info!("✅ Daemon: Connected to registry, status: {}", response.status());
-                
-                let (mut write, mut read) = ws_stream.split();
+        let host_header = format!("{registry_host}:{registry_port}");
+        const SUBPROTOCOL: &str = "graphql-transport-ws";
 
-                // Send connection_init exactly like Node.js version
-                let init_message = serde_json::json!({
-                    "type": "connection_init"
-                });
-                let init_json = serde_json::to_string(&init_message)?;
-                info!("📤 Daemon: Sending connection_init: {}", init_json);
-                write.send(Message::Text(init_json)).await?;
-
-                while let Some(message) = read.next().await {
-                    match message {
-                        Ok(Message::Text(text)) => {
-                            info!("📨 Daemon: Raw message from registry: {}", text);
-                            if let Err(e) = self.handle_registry_message(&mut write, &text).await {
-                                error!("Error handling registry message: {}", e);
-                            }
-                        }
-                        Ok(Message::Close(frame)) => {
-                            if let Some(f) = frame {
-                                info!("🔌 Daemon: Registry connection closed: code={:?}, reason='{}'", f.code, f.reason);
-                            } else {
-                                info!("🔌 Daemon: Registry connection closed (no close frame)");
-                            }
-                            break;
-                        }
-                        Ok(Message::Pong(_)) => {
-                            // Ignore pong messages
-                        }
-                        Ok(Message::Ping(data)) => {
-                            // Respond to ping
-                            let _ = write.send(Message::Pong(data)).await;
-                        }
-                        Err(e) => {
-                            error!("❌ Daemon: WebSocket error: {}", e);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                error!("❌ Daemon: Connection with subprotocol failed: {}", e);
-                
-                // Fallback: try without subprotocol
-                info!("🔌 Daemon: Trying without subprotocol...");
-                match connect_async(url).await {
-                    Ok((ws_stream, response)) => {
-                        info!("✅ Daemon: Connected without subprotocol, status: {}", response.status());
-                        
-                        let (mut write, mut read) = ws_stream.split();
-                        
-                        let init_message = serde_json::json!({
-                            "type": "connection_init"
-                        });
-                        let init_json = serde_json::to_string(&init_message)?;
-                        info!("📤 Daemon: Sending connection_init (no subprotocol): {}", init_json);
-                        write.send(Message::Text(init_json)).await?;
-
-                        while let Some(message) = read.next().await {
-                            match message {
-                                Ok(Message::Text(text)) => {
-                                    info!("📨 Daemon: Raw message: {}", text);
-                                    if let Err(e) = self.handle_registry_message(&mut write, &text).await {
-                                        error!("Error handling registry message: {}", e);
-                                    }
-                                }
-                                Ok(Message::Close(frame)) => {
-                                    if let Some(f) = frame {
-                                        info!("🔌 Daemon: Connection closed: code={:?}, reason='{}'", f.code, f.reason);
-                                    }
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!("❌ Daemon: WebSocket error: {}", e);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(e2) => {
-                        error!("❌ Daemon: Both connection attempts failed: {} / {}", e, e2);
-                        return Err(anyhow::anyhow!("Failed to connect to registry"));
-                    }
-                }
-            }
+        async fn connect_with_protocol(url: &str, host: &str) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+            let request = tungstenite::http::Request::builder()
+                .uri(url)
+                .header("Host", host)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+                .header("Sec-WebSocket-Protocol", SUBPROTOCOL)
+                .body(())?;
+            let (ws_stream, response) = connect_async(request).await?;
+            info!("✅ Daemon: Connected (status {}) with subprotocol {}", response.status(), SUBPROTOCOL);
+            Ok(ws_stream)
         }
 
-        Ok(())
+        let ws_stream = connect_with_protocol(&url, &host_header).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Send connection_init (empty payload acceptable)
+        let init = serde_json::json!({"type": "connection_init"});
+        let init_txt = serde_json::to_string(&init)?;
+        info!("📤 Daemon: Sending connection_init");
+        write.send(WsMessage::Text(init_txt)).await?;
+
+        let mut acknowledged = false;
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(WsMessage::Text(text)) => {
+                    let message: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(e) => { error!("❌ Daemon: Invalid JSON: {}", e); continue; } };
+                    let msg_type = message.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match msg_type {
+                        "connection_ack" => {
+                            info!("📡 Daemon: Received connection_ack");
+                            if !acknowledged {
+                                acknowledged = true;
+                                // Now send subscription
+                                let subscribe_msg = serde_json::json!({
+                                    "id": "registry-sub",
+                                    "type": "subscribe",
+                                    "payload": { "query": "subscription { componentUpdate { id type data createdAt } }" }
+                                });
+                                write.send(WsMessage::Text(subscribe_msg.to_string())).await?;
+                                info!("📡 Daemon: Sent subscribe");
+                            }
+                        }
+                        "next" => {
+                            if let Some(payload) = message.get("payload") { if let Some(data) = payload.get("data") { if let Some(component_update) = data.get("componentUpdate") { match serde_json::from_value::<Component>(component_update.clone()) { Ok(c) => { self.handle_component_from_registry(c).await?; }, Err(e) => error!("❌ Daemon: Deserialize component error: {}", e) } } } }
+                        }
+                        "error" => { error!("❌ Daemon: GraphQL error: {}", message); }
+                        "complete" => { info!("✅ Daemon: Subscription complete from server"); }
+                        "ping" => { let pong = serde_json::json!({"type": "pong"}); write.send(WsMessage::Text(pong.to_string())).await?; }
+                        "pong" => { /* ignore */ }
+                        other => { info!("ℹ️ Daemon: Unhandled message type '{}': {}", other, text); }
+                    }
+                }
+                Ok(WsMessage::Ping(data)) => { write.send(WsMessage::Pong(data)).await?; }
+                Ok(WsMessage::Pong(_)) => {}
+                Ok(WsMessage::Close(frame)) => { if let Some(f) = frame { warn!("🔌 Daemon: Server closed: code={:?} reason='{}'", f.code, f.reason); } break; }
+                Err(e) => { error!("❌ Daemon: WebSocket error: {}", e); break; }
+                _ => {}
+            }
+        }
+        Err(anyhow::anyhow!("Connection loop ended"))
     }
 
     async fn handle_registry_message(
         &self,
         write: &mut SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            Message,
+            WsMessage,
         >,
         text: &str,
     ) -> Result<()> {
@@ -223,143 +456,92 @@ impl ComponentDaemon {
 
         match msg_type {
             "connection_ack" => {
-                info!("📡 Daemon: Registry connection acknowledged, starting subscription...");
-                // Send start subscription using subscriptions-transport-ws format
+                info!("📡 Daemon: Registry connection acknowledged, sending subscribe...");
                 let subscription = serde_json::json!({
                     "id": "registry-sub",
-                    "type": "start",
-                    "payload": {
-                        "query": "subscription { componentUpdate { id type data createdAt } }"
-                    }
+                    "type": "subscribe",
+                    "payload": { "query": "subscription { componentUpdate { id type data createdAt } }" }
                 });
                 let sub_json = serde_json::to_string(&subscription)?;
-                info!("📡 Daemon: Sending subscription: {}", sub_json);
-                write.send(Message::Text(sub_json)).await?;
+                info!("📡 Daemon: Sending subscribe: {}", sub_json);
+                write.send(WsMessage::Text(sub_json)).await?;
             }
-            "data" => {
+            "next" => { // data payload for a subscription event
                 if let Some(payload) = message.get("payload") {
-                    if let Some(errors) = payload.get("errors") {
-                        error!("❌ Daemon: GraphQL subscription errors: {}", 
-                              serde_json::to_string_pretty(errors)?);
-                    } else if let Some(data) = payload.get("data") {
+                    if let Some(data) = payload.get("data") {
                         if let Some(component_update) = data.get("componentUpdate") {
                             match serde_json::from_value::<Component>(component_update.clone()) {
                                 Ok(component) => {
                                     info!("📦 Daemon: Received component from registry: {}", component.id);
                                     self.handle_component_from_registry(component).await?;
                                 },
-                                Err(e) => {
-                                    error!("❌ Daemon: Failed to deserialize component: {}\nValue: {}", e, component_update);
-                                }
+                                Err(e) => { error!("❌ Daemon: Failed to deserialize component: {}\nValue: {}", e, component_update); }
                             }
                         }
                     }
                 }
             }
             "error" => {
-                if let Some(payload) = message.get("payload") {
-                    error!("❌ Daemon: GraphQL error from registry: {}", payload);
-                }
+                if let Some(payload) = message.get("payload") { error!("❌ Daemon: GraphQL error from registry: {}", payload); }
             }
-            "complete" => {
-                info!("✅ Daemon: Subscription completed");
+            "complete" => { info!("✅ Daemon: Subscription completed"); }
+            "ping" => { // respond with pong per protocol
+                info!("💓 Daemon: Received ping, replying pong");
+                let pong = serde_json::json!({"type": "pong"});
+                write.send(WsMessage::Text(serde_json::to_string(&pong)?)).await?;
             }
-            "ka" => {
-                // Keep-alive message from subscriptions-transport-ws
-                info!("💓 Daemon: Keep-alive from registry");
-            }
-            _ => {
-                info!("ℹ️ Daemon: Unknown message type '{}': {}", msg_type, text);
-            }
+            "pong" => { info!("💓 Daemon: Received pong"); }
+            _ => { info!("ℹ️ Daemon: Unknown message type '{}'", msg_type); }
         }
-
         Ok(())
     }
 
     async fn handle_component_from_registry(&self, component: Component) -> Result<()> {
         info!("📦 Daemon: Forwarding component {} to renderer", component.id);
-        self.components.insert(component.id.clone(), component.clone());
-        // Store every received component for history/counting
-        let count = {
+        let state = ComponentState {
+            component: component.clone(),
+            actions: Vec::new(),
+            last_updated: Utc::now(),
+        };
+        self.components.insert(component.id.clone(), state);
+
+        // Store for history
+        {
             let mut all = self.all_components.lock().await;
             all.push(component.clone());
-            all.len()
+            info!("📦 Daemon: Total components so far: {}", all.len());
+        }
+        
+        // Create message for broadcasting
+        let message = DaemonMessage {
+            direction: MessageDirection::Component,
+            payload: serde_json::to_value(component)?,
+            metadata: Some(MessageMetadata {
+                acknowledged: false,
+                correlation_id: Some(Uuid::new_v4().to_string()),
+                error: None,
+            }),
         };
-        info!("📦 Daemon: Total received components so far: {}", count);
-        // Broadcast to all GraphQL subscriptions
-        let _ = self.broadcast_tx.send(component.clone());
+        
+        let _ = self.broadcast_tx.send(message);
         Ok(())
     }
-
-
-
-    pub fn get_components(&self) -> Vec<Component> {
-        self.components.iter().map(|entry| entry.value().clone()).collect()
-    }
-
-    pub async fn get_all_components_count(&self) -> usize {
-        let all = self.all_components.lock().await;
-        all.len()
-    }
-
-    pub fn subscribe_to_updates(&self) -> broadcast::Receiver<Component> {
-        self.broadcast_tx.subscribe()
-    }
 }
-
-// ========================
-// GRAPHQL SCHEMA
-// ========================
-
-pub struct Query;
-
-#[Object]
-impl Query {
-    async fn components(&self, ctx: &async_graphql::Context<'_>) -> Result<Vec<Component>, Error> {
-        let daemon = ctx.data::<ComponentDaemon>()
-            .map_err(|_| Error::new("ComponentDaemon not found in context"))?;
-        Ok(daemon.get_components())
-    }
-}
-
-pub struct Subscription;
-
-#[Subscription]
-impl Subscription {
-    
-    async fn rendererUpdate(&self, ctx: &async_graphql::Context<'_>) -> Result<impl futures::Stream<Item = Component>, Error> {
-        info!("📡 Daemon: Renderer subscribed to updates");
-        
-        let daemon = ctx.data::<ComponentDaemon>()
-            .map_err(|_| Error::new("ComponentDaemon not found in context"))?;
-        
-        let mut receiver = daemon.subscribe_to_updates();
-        
-        let stream = stream! {
-            while let Ok(component) = receiver.recv().await {
-                yield component;
-            }
-        };
-        
-        Ok(stream)
-    }
-}
-
-
 
 // ========================
 // SERVER
 // ========================
 
 pub async fn start_daemon(port: u16) -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
     let daemon = ComponentDaemon::new();
-    daemon.start().await?;
+    // Start the daemon to initiate the registry connection
+    let daemon_for_start = daemon.clone();
+    tokio::spawn(async move {
+        daemon_for_start.connect_to_registry().await;
+    });
 
     // Create GraphQL schema
-    let schema = Schema::build(Query, EmptyMutation, Subscription)
+    let schema = Schema::build(Query, Mutation, Subscription)
         .data(daemon.clone())
         .finish();
 
@@ -392,7 +574,7 @@ pub async fn start_daemon(port: u16) -> Result<()> {
         .and(async_graphql_warp::graphql(schema.clone()))
         .and_then(
             |(schema, request): (
-                async_graphql::Schema<Query, EmptyMutation, Subscription>,
+                async_graphql::Schema<Query, Mutation, Subscription>,
                 async_graphql::Request,
             )| async move {
                 Ok::<_, Infallible>(async_graphql_warp::GraphQLResponse::from(schema.execute(request).await))
@@ -430,5 +612,19 @@ pub async fn start_daemon(port: u16) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    start_daemon(3001).await
+    // Set up tracing first
+    tracing_subscriber::fmt()
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(false)
+        .with_env_filter("info")
+        .init();
+
+    // Start the daemon on port 3001 by default
+    let port = std::env::var("DAEMON_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3001);
+
+    start_daemon(port).await
 }

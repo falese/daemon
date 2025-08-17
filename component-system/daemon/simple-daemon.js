@@ -17,9 +17,10 @@ const WebSocket = require('ws');
 
 class ComponentDaemon {
   constructor() {
-    this.components = new Map();
+    this.components = new Map(); // Maps component ID to ComponentState
     this.pubsub = new PubSub();
     this.registryWs = null;
+    this.registryState = new Map(); // State shared with registry
   }
 
   async start() {
@@ -95,18 +96,101 @@ class ComponentDaemon {
     };
   }
 
+  async handleMessage(message) {
+    console.log(`📨 Daemon: Handling message of type ${message.direction}`);
+    
+    if (message.direction === 'ACTION') {
+      return this.handleAction(message);
+    } else if (message.direction === 'COMPONENT') {
+      return this.handleComponent(message);
+    }
+  }
+
+  async handleAction(message) {
+    const action = message.payload;
+    console.log(`🎯 Daemon: Handling action for component ${action.componentId}`);
+
+    const state = this.components.get(action.componentId);
+    if (state) {
+      state.actions.push(action);
+      state.lastUpdated = new Date().toISOString();
+
+      // Send state update to registry
+      const stateMessage = {
+        direction: 'COMPONENT',
+        payload: state,
+        metadata: {
+          acknowledged: false,
+          correlationId: crypto.randomUUID(),
+          error: null
+        }
+      };
+
+      this.pubsub.publish('MESSAGE', { messages: stateMessage });
+      return stateMessage;
+    }
+    return null;
+  }
+
+  async handleComponent(message) {
+    const component = message.payload;
+    console.log(`📦 Daemon: Handling component ${component.id}`);
+
+    // Create or update component state
+    const state = {
+      component,
+      actions: [],
+      lastUpdated: new Date().toISOString()
+    };
+
+    this.components.set(component.id, state);
+
+    // Forward to renderers with metadata
+    const forwardMessage = {
+      direction: 'COMPONENT',
+      payload: component,
+      metadata: {
+        acknowledged: false,
+        correlationId: crypto.randomUUID(),
+        error: null
+      }
+    };
+
+    this.pubsub.publish('MESSAGE', { messages: forwardMessage });
+    return forwardMessage;
+  }
+
   handleComponentFromRegistry(component) {
     console.log(`📦 Daemon: Forwarding component ${component.id} to renderer`);
     
-    this.components.set(component.id, component);
+    // Create component state if it doesn't exist
+    if (!this.components.has(component.id)) {
+      this.components.set(component.id, {
+        component,
+        actions: [],
+        lastUpdated: new Date().toISOString()
+      });
+    }
 
-    // Forward to renderer
-    this.pubsub.publish('RENDERER_UPDATE', {
-      rendererUpdate: component
-    });
+    // Forward to renderer as a component message
+    const message = {
+      direction: 'COMPONENT',
+      payload: component,
+      metadata: {
+        acknowledged: false,
+        correlationId: crypto.randomUUID(),
+        error: null
+      }
+    };
+
+    this.pubsub.publish('MESSAGE', { messages: message });
   }
 
   getComponents() {
+    return Array.from(this.components.values()).map(state => state.component);
+  }
+
+  getComponentStates() {
     return Array.from(this.components.values());
   }
 }
@@ -122,8 +206,29 @@ const typeDefs = `
     components: [Component!]!
   }
 
+  type Mutation {
+    sendMessage(message: String!): Boolean!
+  }
+
   type Subscription {
-    rendererUpdate: Component!
+    messages: Message!
+  }
+
+  type Message {
+    direction: MessageDirection!
+    payload: JSON!
+    metadata: MessageMetadata
+  }
+
+  enum MessageDirection {
+    COMPONENT
+    ACTION
+  }
+
+  type MessageMetadata {
+    acknowledged: Boolean!
+    correlationId: String
+    error: String
   }
 
   type Component {
@@ -131,6 +236,20 @@ const typeDefs = `
     type: ComponentType!
     data: JSON!
     createdAt: String!
+  }
+
+  type Action {
+    id: String!
+    componentId: String!
+    actionType: String!
+    data: JSON!
+    timestamp: String!
+  }
+
+  type ComponentState {
+    component: Component!
+    actions: [Action!]!
+    lastUpdated: String!
   }
 
   enum ComponentType {
@@ -150,12 +269,19 @@ function createResolvers(daemon) {
       components: () => daemon.getComponents()
     },
 
+    Mutation: {
+      sendMessage: async (_, { message }) => {
+        const msg = JSON.parse(message);
+        await daemon.handleMessage(msg);
+        return true;
+      }
+    },
+
     Subscription: {
-      rendererUpdate: {
+      messages: {
         subscribe: () => {
-          console.log('📡 Daemon: Renderer subscribed to updates');
-          // Use the correct method name that matches the registry
-          return daemon.pubsub.asyncIterableIterator('RENDERER_UPDATE');
+          console.log('📡 Daemon: Client subscribed to messages');
+          return daemon.pubsub.asyncIterableIterator('MESSAGE');
         }
       }
     }

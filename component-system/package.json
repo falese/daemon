@@ -1,9 +1,0 @@
-{
-  "name": "component-system",
-  "private": true,
-  "workspaces": [
-    "registry",
-    "daemon",
-    "renderer"
-  ]
-}

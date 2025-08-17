@@ -11,19 +11,39 @@ A distributed, real-time component rendering system built with GraphQL, Rust, No
 ## 🏗️ Architecture Overview
 
 ```
-┌─────────────────┐    GraphQL Sub    ┌─────────────────┐    GraphQL Sub    ┌─────────────────┐
-│   Component     │─────────────────► │   Component     │─────────────────► │   Frontend      │
-│   Registry      │                   │   Daemon        │                   │   Renderer      │
-│   (Backend)     │                   │   (Middleware)  │                   │   (React App)   │
-│                 │                   │                 │                   │                 │
-│  • Manages      │                   │  • Subscribes   │                   │  • Renders UI   │
-│    Components   │                   │    to Registry  │                   │  • Real-time    │
-│  • REST API     │                   │  • Forwards to  │                   │  • No Business  │
-│  • GraphQL      │                   │    Frontend     │                   │    Logic        │
-│    Publishing   │                   │  • Middleware   │                   │  • Pure View    │
+┌─────────────────┐                   ┌─────────────────┐                   ┌─────────────────┐
+│   Component     │◄──── State ───────│   Component     │       WebSocket   │   Frontend      │
+│   Registry      │                   │   Daemon        │◄───────────────►  │   Renderer      │
+│   (Backend)     │                   │   (Middleware)  │    Components     │   (React App)   │
+│                 │                   │                 │     & Actions     │                 │
+│  • Manages      │                   │  • Maintains    │                   │  • Renders UI   │
+│    Components   │    Components     │    State        │                   │  • Handles      │
+│  • Rules Engine │─────────────────► │  • Message      │                   │    User Input  │
+│  • REST API     │                   │    Router       │                   │  • Processes    │
+│  • GraphQL      │                   │  • State        │                   │    Actions      │
+│    Publishing   │                   │    Machine      │                   │                 │
 └─────────────────┘                   └─────────────────┘                   └─────────────────┘
       Port 4000                             Port 3001                           Port 3000
+
+Message Flow:
+1. User interacts with component in Renderer
+2. Action sent via WebSocket to Daemon
+3. Daemon updates internal state
+4. State sent to Registry
+5. Registry rules generate new component
+6. Component flows back through WebSocket
 ```
+
+State/Action Flow:
+
+1. User clicks button in Renderer
+2. Action sent to Daemon
+3. Daemon updates internal state
+4. State sent to Registry
+5. Registry rules generate new component
+6. Component flows back through system
+
+````
 
 ## ✨ Key Features
 
@@ -49,7 +69,7 @@ A distributed, real-time component rendering system built with GraphQL, Rust, No
    ```bash
    git clone <repository-url>
    cd daemon
-   ```
+````
 
 2. **Start services using Make:**
 
@@ -178,7 +198,7 @@ curl -X POST http://localhost:4000/render \
 
 ### Error Notification
 
-Test error handling:
+Send an error notification:
 
 ```bash
 curl -X POST http://localhost:4000/render \
@@ -192,6 +212,54 @@ curl -X POST http://localhost:4000/render \
     }
   }'
 ```
+
+### Submitting an Action (Trigger Rules)
+
+After creating a FORM component you can simulate a user SUBMIT action to trigger registry rules (which generate a CARD component from the submitted data).
+
+1. List current components and locate the FORM component id:
+
+```bash
+curl -s -X POST http://localhost:4000/graphql \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"query { components { id type } }"}' | jq -r '.data.components[] | select(.type=="FORM") | .id'
+```
+
+2. Export the id (replace with the value you saw):
+
+```bash
+FORM_ID="<form-id-here>"
+```
+
+3. Send the SUBMIT action to the Rust daemon (which forwards via handleMessage mutation to the registry):
+
+```bash
+curl -X POST http://localhost:3001/graphql \
+  -H 'Content-Type: application/json' \
+  -d "{\"query\":\"mutation($m:String!){sendMessage(message:$m)}\",\"variables\":{\"m\":\"{\\\"direction\\\":\\\"ACTION\\\",\\\"payload\\\":{\\\"id\\\":\\\"action-$(date +%s)\\\",\\\"componentId\\\":\\\"$FORM_ID\\\",\\\"actionType\\\":\\\"SUBMIT\\\",\\\"data\\\":{\\\"name\\\":\\\"Alice\\\",\\\"email\\\":\\\"alice@example.com\\\",\\\"message\\\":\\\"Hello Registry!\\\"},\\\"timestamp\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"},\\\"metadata\\\":{\\\"acknowledged\\\":false,\\\"correlationId\\\":\\\"manual-test\\\",\\\"error\\\":null}}\"}}"
+```
+
+4. Watch logs (separate terminals):
+
+```bash
+# Registry rule evaluation & component generation
+docker compose logs -f registry | egrep 'Registry: (Handling message|Processing action|Evaluating rules|Rule|Publishing new component|No rules triggered)'
+
+# Daemon action flow & mutation forwarding
+docker compose logs -f rust-daemon | egrep 'Received ACTION|Mutation WS|Sending handleMessage'
+```
+
+Expected sequence:
+
+- Daemon logs: Received ACTION, Mutation WS connected, mutation sent, received complete (or close after result)
+- Registry logs: Handling message, Processing action, Evaluating rules, Rule 'form-submit' triggered, Publishing new component
+- Renderer displays new CARD component containing submitted data
+
+Troubleshooting:
+
+- If no rule triggers: ensure FORM_ID matches an active FORM component
+- If registry shows no handleMessage lines: confirm daemon action curl succeeded and daemon container is running
+- If WS closes with code 1006 before mutation: check that mutation braces are single ( `mutation handleMessage($message: String!) { handleMessage ... }` )
 
 ## 🏛️ Component Types
 
@@ -355,35 +423,226 @@ Content-Type: application/json
 GET http://localhost:4000/
 ```
 
-### Registry GraphQL API
+### Bidirectional GraphQL Communication
 
-#### Subscribe to Components
+#### Subscribe to Message Stream
 
 ```graphql
 subscription {
-  componentUpdate {
-    id
-    type
-    data
-    createdAt
+  message {
+    direction: "COMPONENT" | "ACTION"
+    payload: {
+      id: ID!
+      type: String!
+      data: JSON!
+      timestamp: Int!
+      origin: String  # "REGISTRY" | "DAEMON" | "RENDERER"
+      target: String  # "REGISTRY" | "DAEMON" | "RENDERER"
+    }
+    metadata: {
+      acknowledged: Boolean
+      correlationId: String
+      error: String
+    }
   }
 }
 ```
 
-### Daemon GraphQL API
+#### Message Types
 
-#### Subscribe to Renderer Updates
+1. **Component Message**
 
-```graphql
-subscription {
-  rendererUpdate {
-    id
-    type
-    data
-    createdAt
+```json
+{
+  "direction": "COMPONENT",
+  "payload": {
+    "id": "card-123",
+    "type": "CARD",
+    "data": {
+      "title": "Example Card",
+      "content": "Card content"
+    },
+    "timestamp": 1628509843,
+    "origin": "REGISTRY",
+    "target": "RENDERER"
   }
 }
 ```
+
+2. **Action Message**
+
+```json
+{
+  "direction": "ACTION",
+  "payload": {
+    "id": "action-456",
+    "type": "BUTTON_CLICK",
+    "data": {
+      "componentId": "card-123",
+      "buttonId": "submit"
+    },
+    "timestamp": 1628509844,
+    "origin": "RENDERER",
+    "target": "DAEMON"
+  }
+}
+```
+
+### State Management
+
+#### Daemon State Structure
+
+```typescript
+interface DaemonState {
+  components: {
+    [componentId: string]: {
+      type: string;
+      data: any;
+      actions: Action[];
+      timestamp: number;
+    };
+  };
+  globalState: {
+    [key: string]: any;
+  };
+}
+```
+
+#### Registry Rules Engine
+
+Rules in the registry determine what components to generate based on daemon state:
+
+```javascript
+// Example rule in registry
+const rules = {
+  BUTTON_CLICK: (state, action) => {
+    if (action.data.buttonId === "submit") {
+      return {
+        type: "NOTIFICATION",
+        data: {
+          type: "SUCCESS",
+          title: "Form Submitted",
+          message: "Your form has been processed",
+        },
+      };
+    }
+  },
+};
+```
+
+#### Bidirectional Communication Example
+
+1. **React Renderer Setup:**
+
+   ```javascript
+   // In React renderer
+   const MessageContext = createContext();
+
+   function MessageProvider({ children }) {
+     const client = useRef();
+     const [subscription, setSubscription] = useState();
+
+     useEffect(() => {
+       // Setup WebSocket subscription
+       const sub = client.current
+         .subscribe({
+           query: MESSAGE_SUBSCRIPTION,
+           variables: { origin: "RENDERER" },
+         })
+         .subscribe(({ data }) => {
+           const { direction, payload } = data.message;
+           if (direction === "COMPONENT") {
+             handleNewComponent(payload);
+           }
+         });
+
+       setSubscription(sub);
+       return () => sub.unsubscribe();
+     }, []);
+
+     const sendAction = (action) => {
+       subscription.next({
+         direction: "ACTION",
+         payload: {
+           ...action,
+           timestamp: Date.now(),
+           origin: "RENDERER",
+           target: "DAEMON",
+         },
+       });
+     };
+
+     return (
+       <MessageContext.Provider value={{ sendAction }}>
+         {children}
+       </MessageContext.Provider>
+     );
+   }
+   ```
+
+2. **Rust Daemon Handling:**
+
+   ```rust
+   // In Rust daemon
+   #[derive(async_graphql::SimpleObject)]
+   struct Message {
+       direction: String,
+       payload: Json,
+       metadata: Option<Json>,
+   }
+
+   struct MessageStream;
+
+   #[Subscription]
+   impl MessageStream {
+       async fn message(
+           &self,
+           ctx: &Context<'_>,
+       ) -> impl Stream<Item = Message> {
+           let (tx, rx) = channel(100);
+
+           // Handle incoming messages
+           tokio::spawn(async move {
+               while let Some(msg) = rx.recv().await {
+                   match msg.direction.as_str() {
+                       "ACTION" => handle_action(msg.payload).await,
+                       "COMPONENT" => forward_to_renderer(msg.payload).await,
+                       _ => log::warn!("Unknown message type")
+                   }
+               }
+           });
+
+           rx
+       }
+   }
+   ```
+
+3. **Registry Rules Processing:**
+
+   ```javascript
+   // In registry
+   const processMessage = async (message) => {
+     if (message.direction === "ACTION") {
+       const state = await daemon.getState();
+       const rule = rules[message.payload.type];
+
+       if (rule) {
+         const component = rule(state, message.payload);
+         if (component) {
+           subscription.next({
+             direction: "COMPONENT",
+             payload: {
+               ...component,
+               timestamp: Date.now(),
+               origin: "REGISTRY",
+               target: "RENDERER",
+             },
+           });
+         }
+       }
+     }
+   };
+   ```
 
 ## 🎨 Customization
 

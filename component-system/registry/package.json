@@ -1,10 +1,10 @@
 {
-  "name": "daemon",
+  "name": "registry",
+  "type": "module",
   "version": "1.0.0",
-  "main": "render.js",
+  "main": "simple-registry.js",
   "scripts": {
-    "start": "concurrently \"node simple-registry.js\" \"node simple-daemon.js\" \"cd frontend && npm start\"",
-    "backend": "concurrently \"node simple-registry.js\" \"node simple-daemon.js\""
+    "start": "node simple-registry.js"
   },
   "author": "",
   "license": "ISC",
@@ -15,11 +15,8 @@
     "express": "^4.21.2",
     "graphql": "^16.11.0",
     "graphql-subscriptions": "^3.0.0",
-    "subscriptions-transport-ws": "^0.11.0",
+    "graphql-ws": "^6.0.6",
     "uuid": "^11.1.0",
     "ws": "^8.18.3"
-  },
-  "devDependencies": {
-    "concurrently": "^7.6.0"
   }
 }

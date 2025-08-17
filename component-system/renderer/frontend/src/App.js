@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 
 // ========================
 // REAL COMPONENT RENDERER
@@ -17,6 +17,7 @@ class GraphQLWebSocketClient {
     this.connected = false;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
+    this.messageHandlers = new Map();
   }
 
   connect() {
@@ -74,23 +75,34 @@ class GraphQLWebSocketClient {
 
   handleMessage(message) {
     console.log('📨 Renderer: Raw message from daemon:', message);
-    
+
     switch (message.type) {
       case 'connection_ack':
         console.log('📡 Renderer: Connection acknowledged');
         // Start subscription after connection is acknowledged
         this.startSubscription();
         break;
-        
+
       case 'data':
         console.log('📨 Renderer: Data message received:', message);
         // Handle subscription data
-        const subscription = this.subscriptions.get(message.id);
-        if (subscription && message.payload?.data?.rendererUpdate) {
-          console.log('📦 Renderer: Found rendererUpdate in payload');
-          subscription.callback(message.payload.data.rendererUpdate);
-        } else {
-          console.log('❓ Renderer: No rendererUpdate found in payload:', message.payload);
+        if (message.payload?.data?.messages) {
+          const msg = message.payload.data.messages;
+          console.log(`📦 Renderer: Received ${msg.direction} message:`, msg);
+
+          // Debug: log all registered directions and the incoming direction
+          console.log('[Renderer] Registered directions:', Array.from(this.messageHandlers.keys()));
+          console.log('[Renderer] Incoming direction:', msg.direction, typeof msg.direction, JSON.stringify(msg.direction));
+
+          // Route message to appropriate handler
+          const handlers = this.messageHandlers.get(msg.direction) || [];
+          if (handlers.size !== undefined) {
+            // Set
+            handlers.forEach(handler => handler(msg));
+          } else {
+            // Array fallback
+            handlers.forEach(handler => handler(msg));
+          }
         }
         break;
         
@@ -110,18 +122,21 @@ class GraphQLWebSocketClient {
   startSubscription() {
     const subscriptionId = 'renderer-subscription';
     
-    // GraphQL subscription query
+    // GraphQL subscription query for messages
     const subscription = {
       id: subscriptionId,
       type: 'start',
       payload: {
         query: `
           subscription {
-            rendererUpdate {
-              id
-              type
-              data
-              createdAt
+            messages {
+              direction
+              payload
+              metadata {
+                acknowledged
+                correlationId
+                error
+              }
             }
           }
         `
@@ -130,6 +145,39 @@ class GraphQLWebSocketClient {
 
     this.send(subscription);
     console.log('📡 Renderer: Started subscription to daemon');
+  }
+
+  sendMessage(message) {
+    const mutation = {
+      id: `mutation-${Date.now()}`,
+      type: 'start',
+      payload: {
+        query: `
+          mutation SendMessage($message: String!) {
+            sendMessage(message: $message)
+          }
+        `,
+        variables: {
+          message: JSON.stringify(message)
+        }
+      }
+    };
+
+    this.send(mutation);
+  }
+
+  onMessage(direction, callback) {
+    if (!this.messageHandlers.has(direction)) {
+      this.messageHandlers.set(direction, new Set());
+    }
+    this.messageHandlers.get(direction).add(callback);
+    
+    return () => {
+      const handlers = this.messageHandlers.get(direction);
+      if (handlers) {
+        handlers.delete(callback);
+      }
+    };
   }
 
   subscribe(callback) {
@@ -177,19 +225,20 @@ class ComponentDisplaySystem {
   constructor() {
     this.graphqlClient = new GraphQLWebSocketClient();
     this.components = new Map();
+    this.componentStates = new Map();
     this.subscribers = new Set();
-    this.subscriptionCleanup = null;
+    this.messageHandlerCleanups = new Set();
   }
 
   async connect() {
     try {
-      await this.graphqlClient.connect();
-      
-      // Subscribe to daemon updates
-      this.subscriptionCleanup = this.graphqlClient.subscribe((component) => {
-        this.handleComponentFromDaemon(component);
+      // Register handler BEFORE connecting, so no messages are missed
+      const componentHandler = this.graphqlClient.onMessage('COMPONENT', (message) => {
+        this.handleComponentMessage(message);
       });
+      this.messageHandlerCleanups.add(componentHandler);
 
+      await this.graphqlClient.connect();
       this.notify({ type: 'connected' });
     } catch (error) {
       console.error('❌ Renderer: Failed to connect to daemon:', error);
@@ -205,10 +254,24 @@ class ComponentDisplaySystem {
     this.notify({ type: 'disconnected' });
   }
 
-  handleComponentFromDaemon(component) {
-    console.log(`📦 Renderer: Received component from daemon:`, component);
-    
+  handleComponentMessage(message) {
+    console.log(`📦 Renderer: Received component message:`, message);
+    const component = message.payload;
+    console.debug('[Debug] handleComponentMessage: component:', component);
     this.components.set(component.id, component);
+
+    // Initialize or update component state
+    if (!this.componentStates.has(component.id)) {
+      this.componentStates.set(component.id, {
+        component,
+        actions: [],
+        lastUpdated: new Date().toISOString()
+      });
+    }
+
+    // Debug: log all components after update
+    console.debug('[Debug] handleComponentMessage: all components:', Array.from(this.components.values()));
+
     this.notify({ type: 'components_changed' });
 
     // Handle auto-removal if specified
@@ -221,7 +284,31 @@ class ComponentDisplaySystem {
 
   removeComponent(componentId) {
     this.components.delete(componentId);
+    this.componentStates.delete(componentId);
     this.notify({ type: 'components_changed' });
+  }
+
+  sendAction(componentId, actionType, data) {
+    const action = {
+      id: `action-${Date.now()}`,
+      componentId,
+      actionType,
+      data,
+      timestamp: new Date().toISOString()
+    };
+
+    const message = {
+      direction: 'ACTION',
+      payload: action,
+      metadata: {
+        acknowledged: false,
+        correlationId: `${action.id}`,
+        error: null
+      }
+    };
+
+    // Send the action using the GraphQL mutation
+    this.graphqlClient.sendMessage(message);
   }
 
   subscribe(callback) {
@@ -243,8 +330,11 @@ class ComponentDisplaySystem {
 // ========================
 
 const UIRenderers = {
-  CARD: ({ data }) => (
-    <div className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4">
+  CARD: ({ data, componentId, onAction }) => (
+    <div 
+      className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4 cursor-pointer"
+      onClick={() => onAction(componentId, 'CLICK', { timestamp: new Date().toISOString() })}
+    >
       {data.title && (
         <h2 className="text-xl font-bold text-gray-900 mb-2">{data.title}</h2>
       )}
@@ -257,6 +347,10 @@ const UIRenderers = {
             <button
               key={index}
               className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+              onClick={(e) => {
+                e.stopPropagation();
+                onAction(componentId, 'BUTTON_CLICK', { buttonIndex: index, ...button });
+              }}
             >
               {button.text}
             </button>
@@ -282,73 +376,106 @@ const UIRenderers = {
     );
   },
 
-  FORM: ({ data }) => (
-    <div className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4">
-      {data.title && (
-        <h2 className="text-xl font-bold text-gray-900 mb-4">{data.title}</h2>
-      )}
-      <div className="space-y-4">
-        {data.fields?.map((field, index) => (
-          <div key={index}>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              {field.label}
-            </label>
-            <input
-              type={field.type?.toLowerCase() || 'text'}
-              placeholder={field.placeholder}
-              className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-blue-500"
-            />
-          </div>
-        ))}
-        <button className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
+  FORM: ({ data, componentId, onAction }) => {
+    const [formData, setFormData] = React.useState({});
+    
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      onAction(componentId, 'SUBMIT', formData);
+    };
+
+    return (
+      <form onSubmit={handleSubmit} className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4">
+        {data.title && (
+          <h2 className="text-xl font-bold text-gray-900 mb-4">{data.title}</h2>
+        )}
+        <div className="space-y-4">
+          {data.fields?.map((field, index) => (
+            <div key={index}>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                {field.label}
+              </label>
+              <input
+                type={field.type?.toLowerCase() || 'text'}
+                placeholder={field.placeholder}
+                className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-blue-500"
+                onChange={(e) => setFormData(prev => ({
+                  ...prev,
+                  [field.name || field.label]: e.target.value
+                }))}
+              />
+            </div>
+          ))}
+        </div>
+        <button
+          type="submit"
+          className="mt-4 w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+        >
           {data.submitText || 'Submit'}
         </button>
-      </div>
-    </div>
-  )
+      </form>
+    );
+  }
 };
 
 // ========================
 // REACT HOOKS
 // ========================
 
+const singletonDisplaySystem = new ComponentDisplaySystem();
 const useComponentDisplay = () => {
-  const [displaySystem] = useState(() => new ComponentDisplaySystem());
-  const [components, setComponents] = useState([]);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState(null);
+  const [state, setState] = useState({
+    components: [],
+    connected: false,
+    error: null
+  });
+
+  const handleAction = useCallback((componentId, actionType, data) => {
+    console.log('[Renderer] onAction called', { componentId, actionType, data });
+    singletonDisplaySystem.sendAction(componentId, actionType, data);
+  }, []);
 
   useEffect(() => {
-    const unsubscribe = displaySystem.subscribe((event) => {
+    const unsubscribe = singletonDisplaySystem.subscribe((event) => {
+      console.log('[Renderer] Event from display system:', event);
       switch (event.type) {
         case 'connected':
-          setConnected(true);
-          setError(null);
+          setState(prev => ({ ...prev, connected: true, error: null }));
           break;
         case 'disconnected':
-          setConnected(false);
+          setState(prev => ({ ...prev, connected: false }));
           break;
         case 'connection_error':
-          setConnected(false);
-          setError(event.error?.message || 'Connection failed');
+          setState(prev => ({ 
+            ...prev, 
+            connected: false, 
+            error: event.error?.message || 'Connection failed' 
+          }));
           break;
         case 'components_changed':
-          setComponents(displaySystem.getComponents());
+          const comps = singletonDisplaySystem.getComponents();
+          console.log('[Renderer] components_changed, new components:', comps);
+          // Extra debug: log each component
+          comps.forEach((c, i) => console.debug(`[Debug] components_changed: component[${i}]:`, c));
+          setState(prev => ({ 
+            ...prev, 
+            components: comps
+          }));
           break;
       }
     });
 
     // Connect to daemon
-    displaySystem.connect();
+    singletonDisplaySystem.connect();
 
     // Cleanup on unmount
     return () => {
       unsubscribe();
-      displaySystem.disconnect();
+      singletonDisplaySystem.disconnect();
     };
-  }, [displaySystem]);
+  }, []);
 
-  return { components, connected, error };
+  return { ...state, onAction: handleAction };
 };
 
 // ========================
@@ -356,7 +483,25 @@ const useComponentDisplay = () => {
 // ========================
 
 export default function RealComponentRenderer() {
-  const { components, connected, error } = useComponentDisplay();
+  const { components, connected, error, onAction } = useComponentDisplay();
+
+  const renderComponent = useCallback((component) => {
+    const Renderer = UIRenderers[component.type];
+    if (!Renderer) {
+      console.warn(`No renderer found for component type: ${component.type}`);
+      return null;
+    }
+
+    return (
+      <div key={component.id} className="mb-4">
+        <Renderer
+          data={component.data}
+          componentId={component.id}
+          onAction={onAction}
+        />
+      </div>
+    );
+  }, [onAction]);
 
   return (
     <div className="min-h-screen bg-gray-50 py-8">
@@ -364,7 +509,7 @@ export default function RealComponentRenderer() {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-3xl font-bold text-gray-900 mb-2">
-            Real Component Renderer
+            Interactive Component Renderer
           </h1>
           <div className="flex items-center justify-center space-x-2 mb-2">
             <div className={`w-3 h-3 rounded-full ${
@@ -377,7 +522,7 @@ export default function RealComponentRenderer() {
             </span>
           </div>
           <p className="text-gray-600">
-            Real GraphQL connection: Registry → Daemon → <strong>Renderer</strong>
+            Interactive Components: Registry ⇄ Daemon ⇄ <strong>Renderer</strong>
           </p>
         </div>
 
@@ -453,7 +598,11 @@ export default function RealComponentRenderer() {
 
             return (
               <div key={component.id} data-component-id={component.id}>
-                <ComponentRenderer data={component.data} />
+                <ComponentRenderer
+                  data={component.data}
+                  componentId={component.id}
+                  onAction={onAction}
+                />
               </div>
             );
           })}
