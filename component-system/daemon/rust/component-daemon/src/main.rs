@@ -56,10 +56,20 @@ impl Subscription {
 // TYPES
 // ========================
 
+#[derive(Clone, Debug, Serialize, Deserialize, Enum, Copy, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MessageKind {
+    ComponentUpdate,
+    StateSnapshot,
+    ActionEcho,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonMessage {
     pub direction: MessageDirection,
+    #[serde(default)]
+    pub kind: Option<MessageKind>,
     pub payload: serde_json::Value,
     pub metadata: Option<MessageMetadata>,
 }
@@ -183,9 +193,26 @@ impl ComponentDaemon {
             state.actions.push(action.clone());
             state.last_updated = Utc::now();
             info!("[Daemon] Updated state for component {}: now has {} actions", action.component_id, state.actions.len());
-            // Send state update to registry
+
+            // --- NEW: Action Echo (immediate ack to renderers) ---
+            let echo_message = DaemonMessage {
+                direction: MessageDirection::Action,
+                kind: Some(MessageKind::ActionEcho),
+                payload: serde_json::to_value(&action)?,
+                metadata: Some(MessageMetadata {
+                    acknowledged: true,
+                    correlation_id: message.metadata.as_ref().and_then(|m| m.correlation_id.clone()).or_else(|| Some(Uuid::new_v4().to_string())),
+                    error: None,
+                }),
+            };
+            let _ = self.broadcast_tx.send(echo_message.clone());
+            info!("[Daemon] Broadcast ACTION_ECHO for action {}", action.id);
+            // --- END NEW ---
+
+            // Send state update snapshot to renderers (distinguished by kind STATE_SNAPSHOT)
             let state_message = DaemonMessage {
                 direction: MessageDirection::Component,
+                kind: Some(MessageKind::StateSnapshot),
                 payload: serde_json::to_value(&*state)?,
                 metadata: Some(MessageMetadata {
                     acknowledged: false,
@@ -318,6 +345,7 @@ impl ComponentDaemon {
         // Forward to renderers
         let forward_message = DaemonMessage {
             direction: MessageDirection::Component,
+            kind: Some(MessageKind::ComponentUpdate),
             payload: message.payload,
             metadata: Some(MessageMetadata {
                 acknowledged: false,
@@ -504,17 +532,15 @@ impl ComponentDaemon {
             last_updated: Utc::now(),
         };
         self.components.insert(component.id.clone(), state);
-
         // Store for history
         {
             let mut all = self.all_components.lock().await;
             all.push(component.clone());
             info!("📦 Daemon: Total components so far: {}", all.len());
         }
-        
-        // Create message for broadcasting
         let message = DaemonMessage {
             direction: MessageDirection::Component,
+            kind: Some(MessageKind::ComponentUpdate),
             payload: serde_json::to_value(component)?,
             metadata: Some(MessageMetadata {
                 acknowledged: false,
@@ -522,7 +548,6 @@ impl ComponentDaemon {
                 error: None,
             }),
         };
-        
         let _ = self.broadcast_tx.send(message);
         Ok(())
     }
