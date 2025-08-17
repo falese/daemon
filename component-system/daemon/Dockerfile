@@ -13,7 +13,9 @@ RUN npm install
 COPY . .
 
 # Expose the port the app runs on
-EXPOSE 3002
+EXPOSE 3001
+
+ENV DAEMON_PORT=3001
 
 # Start the daemon
 CMD ["node", "simple-daemon.js"]

@@ -22,44 +22,33 @@ class GraphQLWebSocketClient {
 
   connect() {
     console.log(`🔌 Renderer: Attempting to connect to daemon at ${this.url}`);
-    
     return new Promise((resolve, reject) => {
       try {
-        // Create WebSocket connection for GraphQL subscriptions
-        this.ws = new WebSocket(this.url, 'graphql-ws');
-        
+        // Modern graphql-transport-ws protocol
+        this.ws = new WebSocket(this.url, 'graphql-transport-ws');
         this.ws.onopen = () => {
           console.log('✅ Renderer: WebSocket opened to daemon');
           this.connected = true;
           this.reconnectAttempts = 0;
-          
-          // Send connection init for graphql-ws protocol
           console.log('📡 Renderer: Sending connection_init to daemon');
-          this.send({
-            type: 'connection_init'
-          });
-          
+          this.send({ type: 'connection_init' });
           resolve();
         };
-
         this.ws.onmessage = (event) => {
-          const message = JSON.parse(event.data);
+          let message; try { message = JSON.parse(event.data); } catch { return; }
           console.log('📨 Renderer: Message received from daemon:', message);
           this.handleMessage(message);
         };
-
         this.ws.onclose = (event) => {
           console.log('🔌 Renderer: WebSocket closed. Code:', event.code, 'Reason:', event.reason);
           this.connected = false;
           this.attemptReconnect();
         };
-
         this.ws.onerror = (error) => {
           console.error('❌ Renderer: WebSocket error:', error);
           console.error('❌ Renderer: WebSocket state:', this.ws.readyState);
           reject(error);
         };
-
       } catch (error) {
         console.error('❌ Renderer: Failed to create WebSocket:', error);
         reject(error);
@@ -75,33 +64,27 @@ class GraphQLWebSocketClient {
 
   handleMessage(message) {
     console.log('📨 Renderer: Raw message from daemon:', message);
-
-    // Accept both legacy 'data' and new 'next'
     switch (message.type) {
       case 'connection_ack':
         console.log('📡 Renderer: Connection acknowledged');
-        // Start subscription after connection is acknowledged
         this.startSubscription();
         break;
-
-      case 'data':
-      case 'next': {
+      case 'next': { // graphql-transport-ws payload
         const container = message.payload?.data?.messages;
         if (container) {
-          const handlers = this.messageHandlers.get(container.direction) || [];
-            (handlers.size !== undefined ? handlers : new Set(handlers)).forEach(h => h(container));
+          const handlers = this.messageHandlers.get(container.direction) || new Set();
+          handlers.forEach(h => h(container));
         }
-        break;
-      }
-      
+        break; }
       case 'error':
         console.error('❌ Renderer: GraphQL error:', message.payload);
         break;
-        
       case 'complete':
-        console.log('✅ Renderer: Subscription completed');
+        console.log('✅ Renderer: Operation completed', message.id);
         break;
-        
+      case 'ping':
+        this.send({ type: 'pong' });
+        break;
       default:
         console.log('📨 Renderer: Unknown message type:', message.type);
     }
@@ -111,18 +94,9 @@ class GraphQLWebSocketClient {
     const subscriptionId = 'renderer-subscription';
     const subscription = {
       id: subscriptionId,
-      type: 'start',
+      type: 'subscribe', // modern protocol
       payload: {
-        query: `
-          subscription {
-            messages {
-              direction
-              kind
-              payload
-              metadata { acknowledged correlationId error }
-            }
-          }
-        `
+        query: `\n          subscription {\n            messages {\n              direction\n              kind\n              payload\n              metadata { acknowledged correlationId error }\n            }\n          }\n        `
       }
     };
     this.send(subscription);
@@ -130,21 +104,15 @@ class GraphQLWebSocketClient {
   }
 
   sendMessage(message) {
+    const opId = `mutation-${Date.now()}`;
     const mutation = {
-      id: `mutation-${Date.now()}`,
-      type: 'start',
+      id: opId,
+      type: 'subscribe', // mutations/queries use subscribe frame
       payload: {
-        query: `
-          mutation SendMessage($message: String!) {
-            sendMessage(message: $message)
-          }
-        `,
-        variables: {
-          message: JSON.stringify(message)
-        }
+        query: `\n          mutation SendMessage($message: String!) {\n            sendMessage(message: $message)\n          }\n        `,
+        variables: { message: JSON.stringify(message) }
       }
     };
-
     this.send(mutation);
   }
 
@@ -153,26 +121,19 @@ class GraphQLWebSocketClient {
       this.messageHandlers.set(direction, new Set());
     }
     this.messageHandlers.get(direction).add(callback);
-    
     return () => {
       const handlers = this.messageHandlers.get(direction);
-      if (handlers) {
-        handlers.delete(callback);
-      }
+      if (handlers) handlers.delete(callback);
     };
   }
 
   subscribe(callback) {
     const subscriptionId = 'renderer-subscription';
     this.subscriptions.set(subscriptionId, { callback });
-    
     return () => {
       this.subscriptions.delete(subscriptionId);
       if (this.connected) {
-        this.send({
-          id: subscriptionId,
-          type: 'stop'
-        });
+        this.send({ id: subscriptionId, type: 'complete' }); // terminate subscription
       }
     };
   }
@@ -181,21 +142,14 @@ class GraphQLWebSocketClient {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.log(`🔄 Renderer: Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-      
-      setTimeout(() => {
-        this.connect().catch(() => {
-          console.log('❌ Renderer: Reconnection failed');
-        });
-      }, 2000 * this.reconnectAttempts);
+      setTimeout(() => { this.connect().catch(() => console.log('❌ Renderer: Reconnection failed')); }, 2000 * this.reconnectAttempts);
     } else {
       console.log('❌ Renderer: Max reconnection attempts reached');
     }
   }
 
   disconnect() {
-    if (this.ws) {
-      this.ws.close();
-    }
+    if (this.ws) this.ws.close();
   }
 }
 

@@ -24,7 +24,7 @@ services:
       context: ./component-system/daemon
       dockerfile: Dockerfile
     ports:
-      - "3002:3002"
+      - "3001:3001"
     depends_on:
       - registry
     networks:

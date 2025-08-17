@@ -1,339 +1,206 @@
 // ========================
-// SIMPLE COMPONENT DAEMON
-// Actually connects to registry and forwards to renderer
+// SIMPLE COMPONENT DAEMON (Node.js parity with Rust implementation)
+// Cleaned version
 // ========================
 
-const { ApolloServer } = require('apollo-server-express');
+const express = require('express');
 const { createServer } = require('http');
-const { SubscriptionServer } = require('subscriptions-transport-ws');
 const { makeExecutableSchema } = require('@graphql-tools/schema');
 const { PubSub } = require('graphql-subscriptions');
-const express = require('express');
+const { useServer } = require('graphql-ws/lib/use/ws');
+const { WebSocketServer } = require('ws');
+const { v4: uuidv4 } = require('uuid');
 const WebSocket = require('ws');
+const GraphQLJSON = require('graphql-type-json');
+const { execute, subscribe } = require('graphql');
 
-// ========================
-// DAEMON
-// ========================
+// --- Constants / Enums ---
+const WS_SUBPROTOCOL = 'graphql-transport-ws';
+const MessageDirection = Object.freeze({ COMPONENT: 'COMPONENT', ACTION: 'ACTION' });
+const MessageKind = Object.freeze({ COMPONENT_UPDATE: 'COMPONENT_UPDATE', STATE_SNAPSHOT: 'STATE_SNAPSHOT', ACTION_ECHO: 'ACTION_ECHO' });
 
+// --- Component Daemon ---
 class ComponentDaemon {
   constructor() {
-    this.components = new Map(); // Maps component ID to ComponentState
+    this.componentState = new Map(); // id -> { component, actions: [], lastUpdated }
     this.pubsub = new PubSub();
-    this.registryWs = null;
-    this.registryState = new Map(); // State shared with registry
+    this.registrySocket = null;
+    this.registryReconnectAttempt = 0;
+    this.stopping = false;
   }
 
-  async start() {
-    // Connect to registry via WebSocket (GraphQL subscription transport)
-    this.connectToRegistry();
-    console.log('🚀 Daemon: Started');
-  }
+  start() { this.connectToRegistry(); }
 
+  // Registry subscription connection
   connectToRegistry() {
-    console.log('🔌 Daemon: Connecting to registry...');
-    
-    this.registryWs = new WebSocket('ws://localhost:4000/graphql', 'graphql-ws');
-    
-    this.registryWs.onopen = () => {
-      console.log('✅ Daemon: Connected to registry');
-      
-      // Initialize GraphQL-WS connection
-      this.registryWs.send(JSON.stringify({
-        type: 'connection_init'
-      }));
-    };
+    if (this.stopping) return;
+    const host = process.env.REGISTRY_HOST || 'registry';
+    const port = process.env.REGISTRY_PORT || '4000';
+    const url = `ws://${host}:${port}/graphql`;
+    const ws = new WebSocket(url, WS_SUBPROTOCOL);
+    this.registrySocket = ws;
 
-    this.registryWs.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      console.log('📨 Daemon: Received message from registry:', message);
-      
-      if (message.type === 'connection_ack') {
-        console.log('📡 Daemon: Registry connection acknowledged, starting subscription...');
-        
-        // Start subscription to registry
-        this.registryWs.send(JSON.stringify({
-          id: 'registry-sub',
-          type: 'start',
-          payload: {
-            query: `
-              subscription {
-                componentUpdate {
-                  id
-                  type
-                  data
-                  createdAt
-                }
-              }
-            `
-          }
-        }));
-        console.log('📡 Daemon: Subscription request sent to registry');
-      }
-      
-      if (message.type === 'data') {
-        if (message.payload?.errors) {
-          console.error('❌ Daemon: GraphQL subscription errors:', JSON.stringify(message.payload.errors, null, 2));
-        } else if (message.payload?.data?.componentUpdate) {
-          const component = message.payload.data.componentUpdate;
-          console.log('📦 Daemon: Received component from registry:', component.id);
-          this.handleComponentFromRegistry(component);
-        }
-      }
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'connection_init' }));
 
-      if (message.type === 'error') {
-        console.error('❌ Daemon: GraphQL error from registry:', message.payload);
+    ws.onmessage = (evt) => {
+      let msg; try { msg = JSON.parse(evt.data); } catch { return; }
+      switch (msg.type) {
+        case 'connection_ack':
+          ws.send(JSON.stringify({ id: 'registry-sub', type: 'subscribe', payload: { query: 'subscription { componentUpdate { id type data createdAt } }' } }));
+          break;
+        case 'next': {
+          const comp = msg.payload?.data?.componentUpdate; if (comp) this.handleComponentFromRegistry(comp); break; }
+        case 'ping': ws.send(JSON.stringify({ type: 'pong' })); break;
       }
     };
 
-    this.registryWs.onclose = () => {
-      console.log('🔌 Daemon: Disconnected from registry');
-      // Attempt to reconnect
-      setTimeout(() => this.connectToRegistry(), 2000);
-    };
-
-    this.registryWs.onerror = (error) => {
-      console.error('❌ Daemon: Registry connection error:', error);
+    ws.onclose = () => {
+      if (this.stopping) return;
+      const delay = Math.min(5000, 400 * Math.pow(1.6, this.registryReconnectAttempt++));
+      setTimeout(() => this.connectToRegistry(), delay);
     };
   }
 
+  // Message handling entry
   async handleMessage(message) {
-    console.log(`📨 Daemon: Handling message of type ${message.direction}`);
-    
-    if (message.direction === 'ACTION') {
-      return this.handleAction(message);
-    } else if (message.direction === 'COMPONENT') {
-      return this.handleComponent(message);
-    }
-  }
-
-  async handleAction(message) {
-    const action = message.payload;
-    console.log(`🎯 Daemon: Handling action for component ${action.componentId}`);
-
-    const state = this.components.get(action.componentId);
-    if (state) {
-      state.actions.push(action);
-      state.lastUpdated = new Date().toISOString();
-
-      // Send state update to registry
-      const stateMessage = {
-        direction: 'COMPONENT',
-        payload: state,
-        metadata: {
-          acknowledged: false,
-          correlationId: crypto.randomUUID(),
-          error: null
-        }
-      };
-
-      this.pubsub.publish('MESSAGE', { messages: stateMessage });
-      return stateMessage;
-    }
+    if (!message || typeof message !== 'object') return null;
+    if (message.direction === MessageDirection.ACTION) return this.handleAction(message);
+    if (message.direction === MessageDirection.COMPONENT) return this.handleInboundComponent(message);
     return null;
   }
 
-  async handleComponent(message) {
-    const component = message.payload;
-    console.log(`📦 Daemon: Handling component ${component.id}`);
+  async handleAction(envelope) {
+    const action = envelope.payload;
+    const state = this.componentState.get(action.componentId);
+    if (state) { state.actions.push(action); state.lastUpdated = new Date().toISOString(); }
 
-    // Create or update component state
-    const state = {
-      component,
-      actions: [],
-      lastUpdated: new Date().toISOString()
-    };
+    // ACTION_ECHO
+    const echo = this.buildMessage({
+      direction: MessageDirection.ACTION,
+      kind: MessageKind.ACTION_ECHO,
+      payload: action,
+      metadata: { acknowledged: true, correlationId: (envelope.metadata && envelope.metadata.correlationId) || action.id, error: null }
+    });
+    this.publish(echo);
 
-    this.components.set(component.id, state);
+    // STATE_SNAPSHOT
+    if (state) {
+      this.publish(this.buildMessage({
+        direction: MessageDirection.COMPONENT,
+        kind: MessageKind.STATE_SNAPSHOT,
+        payload: { component: state.component, actions: state.actions, lastUpdated: state.lastUpdated }
+      }));
+    }
 
-    // Forward to renderers with metadata
-    const forwardMessage = {
-      direction: 'COMPONENT',
-      payload: component,
-      metadata: {
-        acknowledged: false,
-        correlationId: crypto.randomUUID(),
-        error: null
-      }
-    };
+    // Forward action to registry
+    this.forwardActionToRegistry(envelope).catch(()=>{});
+    return echo;
+  }
 
-    this.pubsub.publish('MESSAGE', { messages: forwardMessage });
-    return forwardMessage;
+  async handleInboundComponent(envelope) {
+    const comp = envelope.payload; if (!comp || !comp.id) return null;
+    this.storeComponent(comp);
+    const msg = this.buildMessage({ direction: MessageDirection.COMPONENT, kind: MessageKind.COMPONENT_UPDATE, payload: comp });
+    this.publish(msg); return msg;
   }
 
   handleComponentFromRegistry(component) {
-    console.log(`📦 Daemon: Forwarding component ${component.id} to renderer`);
-    
-    // Create component state if it doesn't exist
-    if (!this.components.has(component.id)) {
-      this.components.set(component.id, {
-        component,
-        actions: [],
-        lastUpdated: new Date().toISOString()
-      });
-    }
+    if (!component || !component.id) return;
+    this.storeComponent(component);
+    this.publish(this.buildMessage({ direction: MessageDirection.COMPONENT, kind: MessageKind.COMPONENT_UPDATE, payload: component }));
+  }
 
-    // Forward to renderer as a component message
-    const message = {
-      direction: 'COMPONENT',
-      payload: component,
-      metadata: {
-        acknowledged: false,
-        correlationId: crypto.randomUUID(),
-        error: null
-      }
+  storeComponent(component) {
+    const existing = this.componentState.get(component.id);
+    if (existing) { existing.component = component; existing.lastUpdated = new Date().toISOString(); }
+    else this.componentState.set(component.id, { component, actions: [], lastUpdated: new Date().toISOString() });
+  }
+
+  // Fire-and-forget mutation over a short-lived WS
+  async forwardActionToRegistry(envelope) {
+    const host = process.env.REGISTRY_HOST || 'registry';
+    const port = process.env.REGISTRY_PORT || '4000';
+    const url = `ws://${host}:${port}/graphql`;
+    const ws = new WebSocket(url, WS_SUBPROTOCOL);
+    const timer = setTimeout(() => { try { ws.close(); } catch(_){} }, 4000);
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'connection_init' }));
+    ws.onmessage = (evt) => {
+      let msg; try { msg = JSON.parse(evt.data); } catch { return; }
+      if (msg.type === 'connection_ack') {
+        ws.send(JSON.stringify({ id: 'mutation-' + uuidv4(), type: 'subscribe', payload: { query: 'mutation($message:String!){ handleMessage(message:$message) }', variables: { message: JSON.stringify(envelope) } } }));
+      } else if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong' }));
+      else if (msg.type === 'complete') ws.close();
     };
-
-    this.pubsub.publish('MESSAGE', { messages: message });
+    ws.onclose = () => clearTimeout(timer);
   }
 
-  getComponents() {
-    return Array.from(this.components.values()).map(state => state.component);
+  buildMessage({ direction, kind, payload, metadata }) {
+    return { direction, kind, payload, metadata: metadata || { acknowledged: false, correlationId: uuidv4(), error: null } };
   }
-
-  getComponentStates() {
-    return Array.from(this.components.values());
-  }
+  publish(message) { this.pubsub.publish('MESSAGES', { messages: message }); }
+  getComponents() { return Array.from(this.componentState.values()).map(s => s.component); }
+  getComponentStates() { return Array.from(this.componentState.values()); }
 }
 
-// ========================
-// GRAPHQL SCHEMA (FOR RENDERER)
-// ========================
-
+// --- GraphQL Schema ---
 const typeDefs = `
   scalar JSON
-
-  type Query {
-    components: [Component!]!
-  }
-
-  type Mutation {
-    sendMessage(message: String!): Boolean!
-  }
-
-  type Subscription {
-    messages: Message!
-  }
-
-  type Message {
-    direction: MessageDirection!
-    payload: JSON!
-    metadata: MessageMetadata
-  }
-
-  enum MessageDirection {
-    COMPONENT
-    ACTION
-  }
-
-  type MessageMetadata {
-    acknowledged: Boolean!
-    correlationId: String
-    error: String
-  }
-
-  type Component {
-    id: String!
-    type: ComponentType!
-    data: JSON!
-    createdAt: String!
-  }
-
-  type Action {
-    id: String!
-    componentId: String!
-    actionType: String!
-    data: JSON!
-    timestamp: String!
-  }
-
-  type ComponentState {
-    component: Component!
-    actions: [Action!]!
-    lastUpdated: String!
-  }
-
-  enum ComponentType {
-    CARD
-    NOTIFICATION
-    FORM
-  }
+  enum MessageDirection { COMPONENT ACTION }
+  enum MessageKind { COMPONENT_UPDATE STATE_SNAPSHOT ACTION_ECHO }
+  type MessageMetadata { acknowledged: Boolean! correlationId: String error: String }
+  type Message { direction: MessageDirection! kind: MessageKind payload: JSON! metadata: MessageMetadata }
+  type Component { id: String! type: String! data: JSON! createdAt: String! }
+  type Action { id: String! componentId: String! actionType: String! data: JSON! timestamp: String! }
+  type ComponentState { component: Component! actions: [Action!]! lastUpdated: String! }
+  type Query { components: [Component!]! componentStates: [ComponentState!]! }
+  type Mutation { sendMessage(message: String!): Boolean! }
+  type Subscription { messages: Message! }
 `;
-
-// ========================
-// RESOLVERS
-// ========================
 
 function createResolvers(daemon) {
   return {
-    Query: {
-      components: () => daemon.getComponents()
-    },
-
-    Mutation: {
-      sendMessage: async (_, { message }) => {
-        const msg = JSON.parse(message);
-        await daemon.handleMessage(msg);
-        return true;
-      }
-    },
-
-    Subscription: {
-      messages: {
-        subscribe: () => {
-          console.log('📡 Daemon: Client subscribed to messages');
-          return daemon.pubsub.asyncIterableIterator('MESSAGE');
-        }
-      }
-    }
+    JSON: GraphQLJSON,
+    Query: { components: () => daemon.getComponents(), componentStates: () => daemon.getComponentStates() },
+    Mutation: { sendMessage: async (_, { message }) => { let m; try { m = JSON.parse(message); } catch { throw new Error('Invalid JSON'); } await daemon.handleMessage(m); return true; } },
+    Subscription: { messages: { subscribe: () => daemon.pubsub.asyncIterator('MESSAGES') } }
   };
 }
 
-// ========================
-// SERVER
-// ========================
-
+// --- Server Startup ---
 async function startDaemon(port = 3001) {
   const app = express();
   const httpServer = createServer(app);
   const daemon = new ComponentDaemon();
+  daemon.start();
 
-  // Start daemon
-  await daemon.start();
+  const schema = makeExecutableSchema({ typeDefs, resolvers: createResolvers(daemon) });
 
-  // GraphQL setup
-  const schema = makeExecutableSchema({
-    typeDefs,
-    resolvers: createResolvers(daemon)
+  app.use(express.json());
+  app.post('/graphql', async (req, res) => {
+    const { query, variables, operationName } = req.body || {};
+    try {
+      const result = await execute({ schema, document: require('graphql').parse(query), variableValues: variables, operationName, contextValue: { daemon } });
+      res.json(result);
+    } catch (e) { res.status(400).json({ errors: [{ message: e.message }] }); }
   });
 
-  const server = new ApolloServer({ schema });
-  await server.start();
-  server.applyMiddleware({ app, path: '/graphql' });
+  app.get('/', (_req, res) => res.json({ message: 'Component Daemon (Node parity)', components: daemon.getComponents().length, status: 'running' }));
 
-  // Subscription server
-  SubscriptionServer.create(
-    { schema, execute: require('graphql').execute, subscribe: require('graphql').subscribe },
-    { server: httpServer, path: '/graphql' }
-  );
+  const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
+  useServer({ schema, execute, subscribe, context: () => ({ daemon }) }, wsServer);
 
-  app.get('/', (req, res) => {
-    res.json({
-      message: 'Component Daemon - Real Connection',
-      components: daemon.getComponents().length,
-      status: 'Connected to registry'
-    });
-  });
-
-  httpServer.listen(port, () => {
-    console.log(`🚀 Component Daemon running on http://localhost:${port}`);
-    console.log(`📡 GraphQL: http://localhost:${port}/graphql`);
+  httpServer.listen(port, '0.0.0.0', () => {
+    console.log(`🚀 Component Daemon running on http://0.0.0.0:${port}`);
+    console.log(`📡 GraphQL (HTTP+WS): http://0.0.0.0:${port}/graphql`);
   });
 
   return daemon;
 }
 
 if (require.main === module) {
-  startDaemon();
+  const envPort = parseInt(process.env.DAEMON_PORT || '', 10);
+  const port = Number.isFinite(envPort) ? envPort : 3001; // default 3001 (renderer expectation)
+  startDaemon(port).catch(err => { console.error('❌ Daemon start failed', err); process.exit(1); });
 }
 
 module.exports = { startDaemon };
