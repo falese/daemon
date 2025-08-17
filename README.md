@@ -45,6 +45,119 @@ State/Action Flow:
 
 ````
 
+## 📡 Core Data Flows
+
+This system has two primary real-time flows:
+
+1. Component Flow (Backend → Frontend): Registry generates/publishes components that propagate through a daemon to renderers.
+2. Action Flow (Frontend → Backend): User interactions become actions that travel back through the daemon to the registry, trigger rules, and cause new components.
+
+### 1. Component Flow (Registry → Daemon → Renderer)
+
+High-level:
+1. A component is created (REST `/render`, GraphQL `renderComponent`, or a rule firing).
+2. Registry stores state and publishes a GraphQL subscription event (`componentUpdate`).
+3. Daemon maintains a `graphql-transport-ws` subscription to `componentUpdate` and receives the component.
+4. Daemon caches component state and broadcasts it via its own GraphQL subscription endpoint to connected renderers.
+5. Renderer renders/updates UI.
+
+Sequence (ASCII):
+```
+Client (curl)          Registry                  Daemon                    Renderer
+     | POST /render --> |                         |                          |
+     |                  | store component         |                          |
+     |                  | publish componentUpdate |                          |
+     |                  | ---- subscription ----> |                          |
+     |                  |                         | cache & forward          |
+     |                  |                         | ---- subscription ---->  | render
+```
+
+Key Messages:
+- Registry → Daemon (WebSocket subscription event):
+  `{ direction: 'COMPONENT', payload: { id, type, data, createdAt } }`
+- Daemon → Renderer: Similar shape (through async-graphql subscription).
+
+Correlating Logs:
+- Registry: `📦 Registry: Publishing new component <id>`
+- Daemon: `📦 Daemon: Received component from registry: <id>` (or custom log message) then `📦 Daemon: Forwarding component ...`
+- Renderer (if logging): `📦 Renderer: Received component` (React/HTML implementation dependent)
+
+Troubleshooting Component Flow:
+- No components at renderer: Ensure renderer connected to daemon WebSocket (browser console / network tab).
+- Daemon not receiving: Check daemon logs for successful `connection_ack` and `Sent subscribe` lines.
+- Registry publishing but daemon silent: Verify subprotocol `graphql-transport-ws` and that no disconnect loops occur (WS code 1006 hints at protocol mismatch).
+
+### 2. Action Flow (Renderer → Daemon → Registry → New Component)
+
+High-level:
+1. User interacts with a rendered component (e.g., submits a FORM or clicks button).
+2. Renderer sends an ACTION message to the daemon (UI → daemon GraphQL mutation or WS depending on renderer implementation).
+3. Daemon updates local state (adds action to component state).
+4. Daemon forwards the original ACTION to Registry using a one-off GraphQL WebSocket mutation `handleMessage(message: String!)` (current implementation opens a short-lived mutation WS, waits for `connection_ack`, sends mutation, waits for `next`/`complete`).
+5. Registry receives the message, identifies it as `ACTION`, loads current component state, runs rule set.
+6. Matching rule(s) generate new component(s); registry publishes them (Component Flow resumes for those components).
+
+Sequence (ASCII):
+```
+User UI          Renderer            Daemon                    Registry                Daemon (sub)         Renderer
+  | click/submit |                   |                         |                       |                     |
+  | -- ACTION -->| (send to daemon)  | handle_action()         |                       |                     |
+  |              | ----------------> | cache + spawn mutation  |                       |                     |
+  |              |                   | -- WS connect --------> |                       |                     |
+  |              |                   | connection_init         |                       |                     |
+  |              |                   | <--- connection_ack ----|                       |                     |
+  |              |                   | send handleMessage      |                       |                     |
+  |              |                   | ----------------------->| handleAction + rules  |                     |
+  |              |                   |                         | publish component ----|--> sub event ------>| render
+```
+
+Action JSON (logical shape):
+```json
+{
+  "direction": "ACTION",
+  "payload": {
+    "id": "action-<ts>",
+    "componentId": "<component-id>",
+    "actionType": "SUBMIT|CLICK|...",
+    "data": { /* form/button payload */ },
+    "timestamp": "2025-...Z"
+  },
+  "metadata": { "acknowledged": false, "correlationId": "...", "error": null }
+}
+```
+
+Log Correlation (Happy Path SUBMIT):
+1. Daemon: `[Daemon] Received ACTION message` (Rust log) / `Received ACTION`.
+2. Daemon: `Mutation WS connected for handleMessage`.
+3. Daemon: `Sending handleMessage mutation over WS (after ack)`.
+4. Registry: `📨 Registry GraphQL: Handling message` → `🎯 Registry: Processing action for component ...`.
+5. Registry: `🧪 Registry: Evaluating rules ...` → `🔍 Rule 'form-submit' condition => true` → `✨ Rule 'form-submit' triggered`.
+6. Registry: `📦 Registry: Publishing new component <new-id>`.
+7. Daemon: `📦 Daemon: Received component from registry: <new-id>`.
+8. Renderer: new component appears.
+
+Common Failure Points & Remedies:
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| Registry logs show action but `No rules triggered` | Rule condition mismatch (e.g., wrong `actionType`) | Confirm `actionType` string & component type casing |
+| Registry never logs `Processing action` | Mutation not sent / WS failed | Check daemon mutation logs & ensure connection_ack before send |
+| WS code 1006 right after mutation send | GraphQL parse error (double braces) | Ensure mutation is `mutation handleMessage($message: String!) { handleMessage(message: $message) }` |
+| Rule triggers but renderer silent | Daemon not forwarding subscription event | Check daemon subscription still active (no reconnect spam) |
+| Multiple duplicate components | Action retried or form posted multiple times | Deduplicate in renderer or add idempotency (future enhancement) |
+
+### Deep Dive: Why a Separate Mutation WS per Action?
+Current design opens a short-lived WebSocket for each action mutation to guarantee protocol parity (`graphql-transport-ws`) and isolate failures. Potential optimizations:
+- Reuse existing subscription connection for mutations (spec supports queries/mutations over same session).
+- Batch actions and send via a queue + single persistent mutation channel.
+- Add ack message back to renderer to reflect processing completion.
+
+### Future Enhancements (Suggested)
+- Correlation/Ack Flow: Registry returns a success payload → daemon updates metadata. Renderer displays processing status.
+- Rule Introspection Endpoint: `query { rules { name description firedCount } }` for monitoring.
+- Metrics: Counters for actions processed and components generated (Prometheus endpoint).
+- Persistence: Optional durable store for components/actions to survive restarts.
+- Security: API keys or auth tokens on WebSocket connection_init payload.
+
 ## ✨ Key Features
 
 - **🔄 Real-time Component Delivery**: Components appear instantly via GraphQL subscriptions
