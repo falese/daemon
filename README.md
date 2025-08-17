@@ -190,34 +190,44 @@ Current design opens a short-lived WebSocket for each action mutation to guarant
    ```
 
 2. **Build images (optional first run clean build):**
+
 ```bash
 docker compose build --no-cache
 ```
+
 3. **Start services (choose ONE daemon):**
 
 Rust daemon stack:
+
 ```bash
 docker compose up -d registry rust-daemon react-renderer
 ```
+
 Node daemon stack:
+
 ```bash
 docker compose up -d registry node-daemon react-renderer
 ```
+
 > Both daemons bind port 3001. Do NOT run them simultaneously unless you change one to a different host port.
 
 Optional renderers / html:
+
 ```bash
 docker compose up -d html-renderer
 ```
 
 4. **Verify:**
+
 ```bash
 curl http://localhost:4000/   # registry
 curl http://localhost:3001/   # active daemon (rust OR node)
 ```
+
 Open http://localhost:3000 for the React renderer.
 
 5. **Switching daemons:**
+
 ```bash
 docker compose stop rust-daemon
 # or docker compose stop node-daemon
@@ -232,6 +242,7 @@ After starting a stack:
 docker compose ps
 docker compose logs -f rust-daemon   # or node-daemon
 ```
+
 Look for WebSocket handshake sequence:
 `connection_init` → `connection_ack` → `subscribe` → `next` frames.
 
@@ -511,26 +522,34 @@ Dynamic forms with configurable fields.
 ## 🌐 API Reference
 
 ### Active Subscription (Renderer ↔ Daemon)
+
 ```graphql
 subscription {
   messages {
     direction
     kind
     payload
-    metadata { acknowledged correlationId error }
+    metadata {
+      acknowledged
+      correlationId
+      error
+    }
   }
 }
 ```
 
 ### Mutation (Send a Message)
+
 ```graphql
 mutation SendMessage($m: String!) {
   sendMessage(message: $m)
 }
 ```
+
 `$m` is a JSON string of the envelope (ACTION or COMPONENT) matching the daemon schema.
 
 ### Example ACTION Envelope
+
 ```json
 {
   "direction": "ACTION",
@@ -541,7 +560,11 @@ mutation SendMessage($m: String!) {
     "data": { "foo": "bar" },
     "timestamp": "2025-08-16T12:34:56.000Z"
   },
-  "metadata": { "acknowledged": false, "correlationId": "action-1734469900000", "error": null }
+  "metadata": {
+    "acknowledged": false,
+    "correlationId": "action-1734469900000",
+    "error": null
+  }
 }
 ```
 
@@ -549,14 +572,14 @@ mutation SendMessage($m: String!) {
 
 ## 🔍 Troubleshooting (Updated)
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
+| Symptom                        | Cause                                           | Fix                                                                  |
+| ------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------- |
 | WS close code 1006 immediately | Protocol mismatch or both daemons bound to 3001 | Ensure only one daemon; client subprotocol is `graphql-transport-ws` |
-| No `connection_ack` | Registry/daemon not listening or network issue | Check container logs, port 3001 open |
-| ACTION_ECHO missing | Component id unknown to daemon | Ensure component exists before sending action |
-| STATE_SNAPSHOT missing | Action for unknown component | Same as above; create component first |
-| Duplicate components | Rapid rule re-fires / repeated actions | Add client-side de-duplication (id set) |
-| No rule trigger | Rule predicate false | Check actionType & component.type match rule expectations |
+| No `connection_ack`            | Registry/daemon not listening or network issue  | Check container logs, port 3001 open                                 |
+| ACTION_ECHO missing            | Component id unknown to daemon                  | Ensure component exists before sending action                        |
+| STATE_SNAPSHOT missing         | Action for unknown component                    | Same as above; create component first                                |
+| Duplicate components           | Rapid rule re-fires / repeated actions          | Add client-side de-duplication (id set)                              |
+| No rule trigger                | Rule predicate false                            | Check actionType & component.type match rule expectations            |
 
 ## ✨ Key Features
 
