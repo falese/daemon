@@ -24,26 +24,23 @@ A distributed, real-time component rendering system built with GraphQL, Rust, No
 │    Publishing   │                   │    Machine      │                   │                 │
 └─────────────────┘                   └─────────────────┘                   └─────────────────┘
       Port 4000                             Port 3001                           Port 3000
+```
 
-Message Flow:
+### Message Flow (High Level)
 1. User interacts with component in Renderer
 2. Action sent via WebSocket to Daemon
 3. Daemon updates internal state
 4. State sent to Registry
 5. Registry rules generate new component
 6. Component flows back through WebSocket
-```
 
-State/Action Flow:
-
+### State / Action Flow (Expanded Summary)
 1. User clicks button in Renderer
 2. Action sent to Daemon
 3. Daemon updates internal state
 4. State sent to Registry
 5. Registry rules generate new component
 6. Component flows back through system
-
-````
 
 ## 📡 Core Data Flows
 
@@ -137,6 +134,7 @@ Log Correlation (Happy Path SUBMIT):
 8. Renderer: new component appears.
 
 Common Failure Points & Remedies:
+
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | Registry logs show action but `No rules triggered` | Rule condition mismatch (e.g., wrong `actionType`) | Confirm `actionType` string & component type casing |
@@ -182,7 +180,7 @@ Current design opens a short-lived WebSocket for each action mutation to guarant
    ```bash
    git clone <repository-url>
    cd daemon
-````
+   ```
 
 2. **Start services using Make:**
 
@@ -647,115 +645,115 @@ const rules = {
 
 1. **React Renderer Setup:**
 
-   ```javascript
-   // In React renderer
-   const MessageContext = createContext();
+```javascript
+// In React renderer
+const MessageContext = createContext();
 
-   function MessageProvider({ children }) {
-     const client = useRef();
-     const [subscription, setSubscription] = useState();
+function MessageProvider({ children }) {
+  const client = useRef();
+  const [subscription, setSubscription] = useState();
 
-     useEffect(() => {
-       // Setup WebSocket subscription
-       const sub = client.current
-         .subscribe({
-           query: MESSAGE_SUBSCRIPTION,
-           variables: { origin: "RENDERER" },
-         })
-         .subscribe(({ data }) => {
-           const { direction, payload } = data.message;
-           if (direction === "COMPONENT") {
-             handleNewComponent(payload);
-           }
-         });
+  useEffect(() => {
+    // Setup WebSocket subscription
+    const sub = client.current
+      .subscribe({
+        query: MESSAGE_SUBSCRIPTION,
+        variables: { origin: "RENDERER" },
+      })
+      .subscribe(({ data }) => {
+        const { direction, payload } = data.message;
+        if (direction === "COMPONENT") {
+          handleNewComponent(payload);
+        }
+      });
 
-       setSubscription(sub);
-       return () => sub.unsubscribe();
-     }, []);
+    setSubscription(sub);
+    return () => sub.unsubscribe();
+  }, []);
 
-     const sendAction = (action) => {
-       subscription.next({
-         direction: "ACTION",
-         payload: {
-           ...action,
-           timestamp: Date.now(),
-           origin: "RENDERER",
-           target: "DAEMON",
-         },
-       });
-     };
+  const sendAction = (action) => {
+    subscription.next({
+      direction: "ACTION",
+      payload: {
+        ...action,
+        timestamp: Date.now(),
+        origin: "RENDERER",
+        target: "DAEMON",
+      },
+    });
+  };
 
-     return (
-       <MessageContext.Provider value={{ sendAction }}>
-         {children}
-       </MessageContext.Provider>
-     );
-   }
-   ```
+  return (
+    <MessageContext.Provider value={{ sendAction }}>
+      {children}
+    </MessageContext.Provider>
+  );
+}
+```
 
 2. **Rust Daemon Handling:**
 
-   ```rust
-   // In Rust daemon
-   #[derive(async_graphql::SimpleObject)]
-   struct Message {
-       direction: String,
-       payload: Json,
-       metadata: Option<Json>,
-   }
+```rust
+// In Rust daemon
+#[derive(async_graphql::SimpleObject)]
+struct Message {
+    direction: String,
+    payload: Json,
+    metadata: Option<Json>,
+}
 
-   struct MessageStream;
+struct MessageStream;
 
-   #[Subscription]
-   impl MessageStream {
-       async fn message(
-           &self,
-           ctx: &Context<'_>,
-       ) -> impl Stream<Item = Message> {
-           let (tx, rx) = channel(100);
+#[Subscription]
+impl MessageStream {
+    async fn message(
+        &self,
+        ctx: &Context<'_>,
+    ) -> impl Stream<Item = Message> {
+        let (tx, rx) = channel(100);
 
-           // Handle incoming messages
-           tokio::spawn(async move {
-               while let Some(msg) = rx.recv().await {
-                   match msg.direction.as_str() {
-                       "ACTION" => handle_action(msg.payload).await,
-                       "COMPONENT" => forward_to_renderer(msg.payload).await,
-                       _ => log::warn!("Unknown message type")
-                   }
-               }
-           });
+        // Handle incoming messages
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg.direction.as_str() {
+                    "ACTION" => handle_action(msg.payload).await,
+                    "COMPONENT" => forward_to_renderer(msg.payload).await,
+                    _ => log::warn!("Unknown message type")
+                }
+            }
+        });
 
-           rx
-       }
-   }
-   ```
+        rx
+    }
+}
+```
 
 3. **Registry Rules Processing:**
 
-   ```javascript
-   // In registry
-   const processMessage = async (message) => {
-     if (message.direction === "ACTION") {
-       const state = await daemon.getState();
-       const rule = rules[message.payload.type];
+```javascript
+// In registry
+const processMessage = async (message) => {
+  if (message.direction === "ACTION") {
+    const state = await daemon.getState();
+    const rule = rules[message.payload.type];
 
-       if (rule) {
-         const component = rule(state, message.payload);
-         if (component) {
-           subscription.next({
-             direction: "COMPONENT",
-             payload: {
-               ...component,
-               timestamp: Date.now(),
-               origin: "REGISTRY",
-               target: "RENDERER",
-             },
-           });
-         }
-       }
-     }
-   };
-   ```
+    if (rule) {
+      const component = rule(state, message.payload);
+      if (component) {
+        subscription.next({
+          direction: "COMPONENT",
+          payload: {
+            ...component,
+            timestamp: Date.now(),
+            origin: "REGISTRY",
+            target: "RENDERER",
+          },
+        });
+      }
+    }
+  }
+};
+```
 
 ## 🎨 Customization
 
@@ -763,24 +761,24 @@ const rules = {
 
 1. **Update Registry Schema** (`simple-registry.js`):
 
-   ```javascript
-   enum ComponentType {
-     CARD
-     NOTIFICATION
-     FORM
-     TABLE        // Add new type
-   }
-   ```
+```javascript
+enum ComponentType {
+  CARD
+  NOTIFICATION
+  FORM
+  TABLE        // Add new type
+}
+```
 
 2. **Add Renderer** (React App):
-   ```javascript
-   const UIRenderers = {
-     // ... existing renderers
-     TABLE: ({ data }) => (
-       <div className="component-card">{/* Your table implementation */}</div>
-     ),
-   };
-   ```
+```javascript
+const UIRenderers = {
+  // ... existing renderers
+  TABLE: ({ data }) => (
+    <div className="component-card">{/* Your table implementation */}</div>
+  ),
+};
+```
 
 ## 🔍 Troubleshooting
 
@@ -799,179 +797,4 @@ const rules = {
 **Daemon not receiving components:**
 
 - Verify WebSocket connection to registry
-- Check GraphQL subscription query syntax
-- Look for connection errors in daemon logs
-
-**Frontend not showing components:**
-
-- Confirm WebSocket connection to daemon
-- Check browser console for connection errors
-- Verify component renderer types match incoming data
-
-### Debug Commands
-
-**Service Management:**
-
-```bash
-# Stop all services
-make down
-
-# Rebuild and restart all services
-make build && make all
-
-# View logs for all services
-make logs
-
-# Interactive service selection
-make stack
-```
-
-**Health Checks:**
-
-```bash
-# Registry health
-curl http://localhost:4000/
-
-# Daemon health
-curl http://localhost:3001/
-
-# Test Registry GraphQL
-curl -X POST http://localhost:4000/graphql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "query { components { id type } }"}'
-```
-
-### Log Analysis
-
-**View All Logs:**
-
-```bash
-# View all service logs
-make logs
-
-# View logs for specific service
-docker-compose logs registry
-docker-compose logs rust-daemon
-docker-compose logs react-renderer
-```
-
-**Common Log Messages:**
-
-**Registry Logs (`make logs registry`):**
-
-- `📦 Registry: Publishing component` - Component created
-- `📡 Registry: New daemon subscription connected` - Daemon connected
-
-**Daemon Logs (`make logs rust-daemon` or `make logs node-daemon`):**
-
-- `📦 Daemon: Received component from registry` - Component received
-- `📦 Daemon: Forwarding component to renderer` - Component forwarded
-
-**Frontend Logs (`make logs react-renderer` or `make logs html-renderer`):**
-
-- `📦 Renderer: Received component from daemon` - Component received
-- `✅ Renderer: Connected to daemon` - Connection established
-
-**Interactive Stack Management:**
-
-```bash
-# Start services interactively
-make stack
-
-# This allows you to:
-# 1. Choose your daemon (Rust or Node.js)
-# 2. Choose your renderer (React or HTML)
-# 3. View logs for selected components
-```
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Build and test:
-
-   ```bash
-   # Build all services
-   make build
-
-   # Start stack interactively
-   make stack
-
-   # Run tests (after selecting components)
-   curl -X POST http://localhost:4000/render \
-     -H "Content-Type: application/json" \
-     -d '{"type":"NOTIFICATION","data":{"type":"SUCCESS","title":"Test","message":"Test"}}'
-   ```
-
-5. Submit a pull request
-
-## � Development Workflow
-
-### Local Development
-
-1. **Start Base Services:**
-
-   ```bash
-   # Start registry only
-   make up
-   ```
-
-2. **Choose Your Stack:**
-
-   ```bash
-   # Interactive component selection
-   make stack
-   ```
-
-3. **Development Loop:**
-
-   ```bash
-   # Rebuild specific service
-   docker-compose build rust-daemon
-
-   # Restart service
-   make rust-daemon
-
-   # View logs
-   make logs
-   ```
-
-### Common Development Tasks
-
-1. **Switch Daemons:**
-
-   ```bash
-   # Stop current daemon
-   docker-compose stop rust-daemon
-
-   # Start alternative
-   make node-daemon
-   ```
-
-2. **Change Renderers:**
-
-   ```bash
-   # Stop current renderer
-   docker-compose stop react-renderer
-
-   # Start alternative
-   make html-renderer
-   ```
-
-3. **Full System Restart:**
-
-   ```bash
-   # Stop all services
-   make down
-
-   # Rebuild and restart
-   make build
-   make all
-   ```
-
-## �📄 License
-
-MIT License - see LICENSE file for details.
-
----
+- Check GraphQL subscription
