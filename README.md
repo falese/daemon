@@ -172,15 +172,6 @@ Current design opens a short-lived WebSocket for each action mutation to guarant
 - Persistence: Optional durable store for components/actions to survive restarts.
 - Security: API keys or auth tokens on WebSocket connection_init payload.
 
-## ✨ Key Features
-
-- **🔄 Real-time Component Delivery**: Components appear instantly via GraphQL subscriptions
-- **🎨 Dynamic UI Generation**: Backend services can create UI components on-demand
-- **🔧 Middleware Architecture**: Clean separation between backend and frontend
-- **📱 Technology Agnostic**: Backend can be any language, frontend can be any framework
-- **🚀 Scalable**: Multiple daemons and frontends can connect to same registry
-- **💫 Beautiful UI**: Modern glassmorphism design with animations
-
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -198,62 +189,51 @@ Current design opens a short-lived WebSocket for each action mutation to guarant
    cd daemon
    ```
 
-2. **Start services using Make:**
+2. **Build images (optional first run clean build):**
+```bash
+docker compose build --no-cache
+```
+3. **Start services (choose ONE daemon):**
 
-   ```bash
-   # Build all images
-   make build
+Rust daemon stack:
+```bash
+docker compose up -d registry rust-daemon react-renderer
+```
+Node daemon stack:
+```bash
+docker compose up -d registry node-daemon react-renderer
+```
+> Both daemons bind port 3001. Do NOT run them simultaneously unless you change one to a different host port.
 
-   # Start everything at once
-   make all
+Optional renderers / html:
+```bash
+docker compose up -d html-renderer
+```
 
-   # OR use interactive stack launcher
-   make stack  # Guides you through daemon and renderer selection
-   ```
+4. **Verify:**
+```bash
+curl http://localhost:4000/   # registry
+curl http://localhost:3001/   # active daemon (rust OR node)
+```
+Open http://localhost:3000 for the React renderer.
 
-The `make stack` command provides an interactive way to choose:
-
-- Which daemon to run (Rust or Node.js)
-- Which renderer to use (React or HTML)
-
-Individual commands are also available:
-
-- `make rust-daemon` - Start the Rust daemon
-- `make node-daemon` - Start the Node.js daemon
-- `make react-renderer` - Start the React frontend
-- `make html-renderer` - Start the HTML renderer
-
-This will start the selected services:
-
-- Registry (Node.js) on port 4000
-- Rust Daemon on port 3001 (if selected)
-- Node Daemon on port 3002 (if selected)
-- React Renderer on port 3000 (if selected)
-- HTML Renderer on port 8081 (if selected)
+5. **Switching daemons:**
+```bash
+docker compose stop rust-daemon
+# or docker compose stop node-daemon
+# then start the other
+```
 
 ### Verifying the System
 
-After starting the services with Docker Compose, verify each component:
+After starting a stack:
 
-1. **Check service status:**
-
-   ```bash
-   docker-compose ps
-   ```
-
-   All services should show as "Up"
-
-2. **Check component health:**
-
-   - Registry: Visit http://localhost:4000
-   - Rust Daemon: Visit http://localhost:3001
-   - React Renderer: Visit http://localhost:3000
-   - HTML Renderer: Visit http://localhost:8081
-
-3. **View service logs:**
-   ```bash
-   docker-compose logs -f
-   ```
+```bash
+docker compose ps
+docker compose logs -f rust-daemon   # or node-daemon
+```
+Look for WebSocket handshake sequence:
+`connection_init` → `connection_ack` → `subscribe` → `next` frames.
 
 You should see:
 
@@ -475,7 +455,7 @@ Dynamic forms with configurable fields.
    - Alternative daemon implementation in Node.js
    - Same functionality as Rust daemon
    - Demonstrates technology flexibility
-   - Runs in Docker container on port 3002
+   - Runs in Docker container on port 3001
 
 4. **React Renderer (`renderer/frontend`)**
 
@@ -530,288 +510,60 @@ Dynamic forms with configurable fields.
 
 ## 🌐 API Reference
 
-### Registry REST API
-
-#### Render Component
-
-```http
-POST http://localhost:4000/render
-Content-Type: application/json
-
-{
-  "type": "CARD|NOTIFICATION|FORM",
-  "data": { /* component data */ }
-}
-```
-
-#### Health Check
-
-```http
-GET http://localhost:4000/
-```
-
-### Bidirectional GraphQL Communication
-
-#### Subscribe to Message Stream
-
+### Active Subscription (Renderer ↔ Daemon)
 ```graphql
 subscription {
-  message {
-    direction: "COMPONENT" | "ACTION"
-    payload: {
-      id: ID!
-      type: String!
-      data: JSON!
-      timestamp: Int!
-      origin: String  # "REGISTRY" | "DAEMON" | "RENDERER"
-      target: String  # "REGISTRY" | "DAEMON" | "RENDERER"
-    }
-    metadata: {
-      acknowledged: Boolean
-      correlationId: String
-      error: String
-    }
+  messages {
+    direction
+    kind
+    payload
+    metadata { acknowledged correlationId error }
   }
 }
 ```
 
-#### Message Types
-
-1. **Component Message**
-
-```json
-{
-  "direction": "COMPONENT",
-  "payload": {
-    "id": "card-123",
-    "type": "CARD",
-    "data": {
-      "title": "Example Card",
-      "content": "Card content"
-    },
-    "timestamp": 1628509843,
-    "origin": "REGISTRY",
-    "target": "RENDERER"
-  }
+### Mutation (Send a Message)
+```graphql
+mutation SendMessage($m: String!) {
+  sendMessage(message: $m)
 }
 ```
+`$m` is a JSON string of the envelope (ACTION or COMPONENT) matching the daemon schema.
 
-2. **Action Message**
-
+### Example ACTION Envelope
 ```json
 {
   "direction": "ACTION",
   "payload": {
-    "id": "action-456",
-    "type": "BUTTON_CLICK",
-    "data": {
-      "componentId": "card-123",
-      "buttonId": "submit"
-    },
-    "timestamp": 1628509844,
-    "origin": "RENDERER",
-    "target": "DAEMON"
-  }
-}
-```
-
-### State Management
-
-#### Daemon State Structure
-
-```typescript
-interface DaemonState {
-  components: {
-    [componentId: string]: {
-      type: string;
-      data: any;
-      actions: Action[];
-      timestamp: number;
-    };
-  };
-  globalState: {
-    [key: string]: any;
-  };
-}
-```
-
-#### Registry Rules Engine
-
-Rules in the registry determine what components to generate based on daemon state:
-
-```javascript
-// Example rule in registry
-const rules = {
-  BUTTON_CLICK: (state, action) => {
-    if (action.data.buttonId === "submit") {
-      return {
-        type: "NOTIFICATION",
-        data: {
-          type: "SUCCESS",
-          title: "Form Submitted",
-          message: "Your form has been processed",
-        },
-      };
-    }
+    "id": "action-1734469900000",
+    "componentId": "<component-id>",
+    "actionType": "CLICK",
+    "data": { "foo": "bar" },
+    "timestamp": "2025-08-16T12:34:56.000Z"
   },
-};
-```
-
-#### Bidirectional Communication Example
-
-1. **React Renderer Setup:**
-
-```javascript
-// In React renderer
-const MessageContext = createContext();
-
-function MessageProvider({ children }) {
-  const client = useRef();
-  const [subscription, setSubscription] = useState();
-
-  useEffect(() => {
-    // Setup WebSocket subscription
-    const sub = client.current
-      .subscribe({
-        query: MESSAGE_SUBSCRIPTION,
-        variables: { origin: "RENDERER" },
-      })
-      .subscribe(({ data }) => {
-        const { direction, payload } = data.message;
-        if (direction === "COMPONENT") {
-          handleNewComponent(payload);
-        }
-      });
-
-    setSubscription(sub);
-    return () => sub.unsubscribe();
-  }, []);
-
-  const sendAction = (action) => {
-    subscription.next({
-      direction: "ACTION",
-      payload: {
-        ...action,
-        timestamp: Date.now(),
-        origin: "RENDERER",
-        target: "DAEMON",
-      },
-    });
-  };
-
-  return (
-    <MessageContext.Provider value={{ sendAction }}>
-      {children}
-    </MessageContext.Provider>
-  );
+  "metadata": { "acknowledged": false, "correlationId": "action-1734469900000", "error": null }
 }
 ```
 
-2. **Rust Daemon Handling:**
+(Older docs showing `message { ... }` or extra fields like `origin/target/timestamp` at top level are deprecated.)
 
-```rust
-// In Rust daemon
-#[derive(async_graphql::SimpleObject)]
-struct Message {
-    direction: String,
-    payload: Json,
-    metadata: Option<Json>,
-}
+## 🔍 Troubleshooting (Updated)
 
-struct MessageStream;
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| WS close code 1006 immediately | Protocol mismatch or both daemons bound to 3001 | Ensure only one daemon; client subprotocol is `graphql-transport-ws` |
+| No `connection_ack` | Registry/daemon not listening or network issue | Check container logs, port 3001 open |
+| ACTION_ECHO missing | Component id unknown to daemon | Ensure component exists before sending action |
+| STATE_SNAPSHOT missing | Action for unknown component | Same as above; create component first |
+| Duplicate components | Rapid rule re-fires / repeated actions | Add client-side de-duplication (id set) |
+| No rule trigger | Rule predicate false | Check actionType & component.type match rule expectations |
 
-#[Subscription]
-impl MessageStream {
-    async fn message(
-        &self,
-        ctx: &Context<'_>,
-    ) -> impl Stream<Item = Message> {
-        let (tx, rx) = channel(100);
+## ✨ Key Features
 
-        // Handle incoming messages
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                match msg.direction.as_str() {
-                    "ACTION" => handle_action(msg.payload).await,
-                    "COMPONENT" => forward_to_renderer(msg.payload).await,
-                    _ => log::warn!("Unknown message type")
-                }
-            }
-        });
-
-        rx
-    }
-}
-```
-
-3. **Registry Rules Processing:**
-
-```javascript
-// In registry
-const processMessage = async (message) => {
-  if (message.direction === "ACTION") {
-    const state = await daemon.getState();
-    const rule = rules[message.payload.type];
-
-    if (rule) {
-      const component = rule(state, message.payload);
-      if (component) {
-        subscription.next({
-          direction: "COMPONENT",
-          payload: {
-            ...component,
-            timestamp: Date.now(),
-            origin: "REGISTRY",
-            target: "RENDERER",
-          },
-        });
-      }
-    }
-  }
-};
-```
-
-## 🎨 Customization
-
-### Adding New Component Types
-
-1. **Update Registry Schema** (`simple-registry.js`):
-
-```javascript
-enum ComponentType {
-  CARD
-  NOTIFICATION
-  FORM
-  TABLE        // Add new type
-}
-```
-
-2. **Add Renderer** (React App):
-
-```javascript
-const UIRenderers = {
-  // ... existing renderers
-  TABLE: ({ data }) => (
-    <div className="component-card">{/* Your table implementation */}</div>
-  ),
-};
-```
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-**Registry not publishing components:**
-
-- Run `make logs` and check registry output
-- Verify registry service is up with `docker-compose ps`
-- If needed, restart registry:
-  ```bash
-  docker-compose stop registry
-  make up  # Restarts registry
-  ```
-
-**Daemon not receiving components:**
-
-- Verify WebSocket connection to registry
-- Check GraphQL subscription
+- **🔄 Real-time Component Delivery**: Components appear instantly via GraphQL subscriptions
+- **🎨 Dynamic UI Generation**: Backend services can create UI components on-demand
+- **🔧 Middleware Architecture**: Clean separation between backend and frontend
+- **📱 Technology Agnostic**: Backend can be any language, frontend can be any framework
+- **🚀 Scalable**: Multiple daemons and frontends can connect to same registry
+- **💫 Beautiful UI**: Modern glassmorphism design with animations
+- **Unified WebSocket protocol**: `graphql-transport-ws` across Registry, Daemons, Renderer.
