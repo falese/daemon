@@ -412,9 +412,13 @@ impl ComponentDaemon {
     }
 
     async fn try_connect_to_registry(&self) -> Result<()> {
+        if let Ok(full) = std::env::var("REGISTRY_WS_URL") {
+            info!("🔌 Daemon: Using explicit REGISTRY_WS_URL={}", full);
+        }
         let registry_host = std::env::var("REGISTRY_HOST").unwrap_or_else(|_| "registry".to_string());
         let registry_port = std::env::var("REGISTRY_PORT").unwrap_or_else(|_| "4000".to_string());
-        let url = format!("ws://{registry_host}:{registry_port}/graphql");
+        let fallback = format!("ws://{registry_host}:{registry_port}/graphql");
+        let url = std::env::var("REGISTRY_WS_URL").unwrap_or(fallback);
         info!("🔌 Daemon: Attempting to connect to {}", url);
         use tokio_tungstenite::tungstenite;
         let host_header = format!("{registry_host}:{registry_port}");
@@ -664,8 +668,8 @@ async fn main() -> Result<()> {
         .with_env_filter("info")
         .init();
 
-    // Start the daemon on port 3001 by default
     let port = std::env::var("DAEMON_PORT")
+        .or_else(|_| std::env::var("PORT"))
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3001);

@@ -114,9 +114,36 @@
       debugPre.textContent = (debugPre.textContent + '\n' + line).trim().split('\n').slice(-400).join('\n');
     }
 
+    function resolveExplicitWs(){
+      try {
+        const qp = new URLSearchParams(location.search);
+        const daemonParam = qp.get('daemon');
+        if (daemonParam) {
+          if (/^ws(s)?:/i.test(daemonParam)) return daemonParam; // full ws url
+          if (/^\d+$/.test(daemonParam)) { // port only
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            return proto + '://' + location.hostname + ':' + daemonParam + '/graphql';
+          }
+        }
+      } catch(_){}
+      const explicitVar = window.DAEMON_WS_URL || (typeof DAEMON_WS_URL !== 'undefined' && DAEMON_WS_URL);
+      return explicitVar || null;
+    }
+
+    let httpBase = null; // derived HTTP base used for POST actions
+
     function connect(){
+      const explicit = resolveExplicitWs();
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const url = proto + '://' + location.hostname + ':3001/graphql';
+      const host = location.host; // renderer host (only used if no explicit)
+      const url = explicit || (proto + '://' + host + '/graphql');
+      // Derive HTTP base (strip ws(s) scheme if explicit)
+      if (explicit) {
+        httpBase = explicit.replace(/^ws(s)?:\/\//i, function(m){ return m.toLowerCase()==='wss://' ? 'https://' : 'http://'; }).replace(/\/graphql$/,'');
+      } else {
+        const hProto = location.protocol === 'https:' ? 'https' : 'http';
+        httpBase = hProto + '://' + host;
+      }
       setStatus('connecting','Connecting…');
       ws = new WebSocket(url, WS_PROTOCOL);
       ws.onopen = () => {
@@ -319,7 +346,8 @@
         payload: action,
         metadata: { acknowledged:false, correlationId: action.id, error:null }
       };
-      fetch('http://localhost:3001/graphql', {
+      const target = (window.DAEMON_HTTP_URL || (typeof DAEMON_HTTP_URL !== 'undefined' && DAEMON_HTTP_URL)) || (httpBase || 'http://localhost:3001');
+      fetch(target + '/graphql', {
         method:'POST', headers:{ 'Content-Type':'application/json' },
         body: JSON.stringify({
           query: 'mutation($m:String!){sendMessage(message:$m)}',

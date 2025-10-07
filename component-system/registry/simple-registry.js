@@ -279,6 +279,7 @@ function createResolvers(registry) {
 // ========================
 
 async function startRegistry(port = 4000) {
+  const resolvedPort = parseInt(process.env.PORT || String(port), 10) || port;
   const app = express();
   const httpServer = createServer(app);
   const registry = new ComponentRegistry();
@@ -378,10 +379,10 @@ async function startRegistry(port = 4000) {
     }
   }, wsServer);
 
-  httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 Component Registry running on http://0.0.0.0:${port}`);
-    console.log(`📡 GraphQL: http://0.0.0.0:${port}/graphql`);
-    console.log(`🔌 REST: http://0.0.0.0:${port}/render`);
+  httpServer.listen(resolvedPort, '0.0.0.0', () => {
+    console.log(`🚀 Component Registry running on http://0.0.0.0:${resolvedPort}`);
+    console.log(`📡 GraphQL: http://0.0.0.0:${resolvedPort}/graphql`);
+    console.log(`🔌 REST: http://0.0.0.0:${resolvedPort}/render`);
   });
 
   // Send a test component after startup

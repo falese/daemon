@@ -55,9 +55,10 @@ class ComponentDaemon {
   // Registry subscription connection
   connectToRegistry() {
     if (this.stopping) return;
+    const directWs = process.env.REGISTRY_WS_URL; // full ws(s)://host/graphql if provided
     const host = process.env.REGISTRY_HOST || 'registry';
     const port = process.env.REGISTRY_PORT || '4000';
-    const url = `ws://${host}:${port}/graphql`;
+    const url = directWs || `ws://${host}:${port}/graphql`;
     logger.info({ code:'DAE-201', event:'WS_REGISTRY_CONNECT', url, attempt:this.registryReconnectAttempt }, 'Connecting to registry');
     const ws = new WebSocket(url, WS_SUBPROTOCOL);
     this.registrySocket = ws;
@@ -217,6 +218,7 @@ function createResolvers(daemon) {
 
 // --- Server Startup ---
 async function startDaemon(port = 3001) {
+  const resolvedPort = parseInt(process.env.PORT || String(port), 10) || port;
   const app = express();
   const httpServer = createServer(app);
   const daemon = new ComponentDaemon();
@@ -243,8 +245,8 @@ async function startDaemon(port = 3001) {
     onComplete: (_ctx,_msg) => logger.info({ code:'DAE-240', event:'WS_RENDERER_COMPLETE' }, 'Renderer operation complete')
   }, wsServer);
 
-  httpServer.listen(port, '0.0.0.0', () => {
-    logger.info({ code:'DAE-200', event:'STARTUP', port }, 'Daemon listening');
+  httpServer.listen(resolvedPort, '0.0.0.0', () => {
+    logger.info({ code:'DAE-200', event:'STARTUP', port:resolvedPort }, 'Daemon listening');
     logger.info({ code:'DAE-201', event:'WS_REGISTRY_CONNECT_TARGET', registryHost: process.env.REGISTRY_HOST||'registry', registryPort: process.env.REGISTRY_PORT||'4000' }, 'Target registry');
   });
 
@@ -252,8 +254,8 @@ async function startDaemon(port = 3001) {
 }
 
 if (require.main === module) {
-  const envPort = parseInt(process.env.DAEMON_PORT || '', 10);
-  const port = Number.isFinite(envPort) ? envPort : 3001; // default 3001 (renderer expectation)
+  const envPort = parseInt(process.env.DAEMON_PORT || process.env.PORT || '', 10);
+  const port = Number.isFinite(envPort) ? envPort : 3001;
   startDaemon(port).catch(err => { console.error('❌ Daemon start failed', err); process.exit(1); });
 }
 
