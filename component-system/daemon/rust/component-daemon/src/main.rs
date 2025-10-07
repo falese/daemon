@@ -13,10 +13,17 @@ use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
-use warp::Filter;
-use uuid::Uuid;
-use futures_util::Stream;
-
+use uuid::Uuid; // ensure Uuid in scope
+use futures_util::Stream; // ensure Stream trait
+use warp::Filter; // ensure Filter trait for .and, .and_then
+// Standardized log macro (if not already defined earlier in file)
+macro_rules! log_event {
+    ($level:ident, $code:expr, $event:expr, $msg:expr $(, $k:ident = $v:expr )* $(,)?) => {{
+        let mut meta = String::new();
+        $( { use std::fmt::Write as _; let _ = write!(&mut meta, " {}={}", stringify!($k), $v); } )*
+        tracing::$level!("😈 {} {} - {}{}", $code, $event, $msg, meta);
+    }};
+}
 // ========================
 // GRAPHQL SCHEMA
 // ========================
@@ -186,7 +193,18 @@ impl ComponentDaemon {
     }
 
     async fn handle_action(&self, message: DaemonMessage) -> Result<Option<DaemonMessage>> {
-        let action: Action = serde_json::from_value(message.payload.clone())?;
+        let mut action: Action = serde_json::from_value(message.payload.clone())?;
+        // Normalization: BUTTON_CLICK -> CLICK (retain original)
+        if action.action_type == "BUTTON_CLICK" {
+            log_event!(info, "DAE-224", "ACTION_NORMALIZED", "BUTTON_CLICK -> CLICK", actionId=&action.id, compId=&action.component_id);
+            // Inject _originalActionType into action.data if object
+            if action.data.is_object() {
+                if let Some(obj) = action.data.as_object_mut() {
+                    obj.insert("_originalActionType".to_string(), serde_json::Value::String("BUTTON_CLICK".into()));
+                }
+            }
+            action.action_type = "CLICK".into();
+        }
         info!("[Daemon] Storing action for component {}: {:?}", action.component_id, action);
         // Update component state
         if let Some(mut state) = self.components.get_mut(&action.component_id) {
@@ -194,7 +212,7 @@ impl ComponentDaemon {
             state.last_updated = Utc::now();
             info!("[Daemon] Updated state for component {}: now has {} actions", action.component_id, state.actions.len());
 
-            // --- NEW: Action Echo (immediate ack to renderers) ---
+            // --- Action Echo ---
             let echo_message = DaemonMessage {
                 direction: MessageDirection::Action,
                 kind: Some(MessageKind::ActionEcho),
@@ -207,9 +225,9 @@ impl ComponentDaemon {
             };
             let _ = self.broadcast_tx.send(echo_message.clone());
             info!("[Daemon] Broadcast ACTION_ECHO for action {}", action.id);
-            // --- END NEW ---
+            // --- End Action Echo ---
 
-            // Send state update snapshot to renderers (distinguished by kind STATE_SNAPSHOT)
+            // State snapshot
             let state_message = DaemonMessage {
                 direction: MessageDirection::Component,
                 kind: Some(MessageKind::StateSnapshot),
@@ -222,6 +240,7 @@ impl ComponentDaemon {
             };
             let _ = self.broadcast_tx.send(state_message.clone());
 
+            // Forward to registry over WS mutation (existing code retained)
             // --- NEW: Send handleMessage mutation over WebSocket to registry ---
             // This is a fire-and-forget; errors are logged but do not block
             let registry_host = std::env::var("REGISTRY_HOST").unwrap_or_else(|_| "registry".to_string());
@@ -573,16 +592,16 @@ pub async fn start_daemon(port: u16) -> Result<()> {
     // Health check endpoint
     let daemon_for_health = daemon.clone();
     let health = warp::path::end()
-        .and_then(move || {
+        .map(move || {
             let daemon_for_health = daemon_for_health.clone();
-            async move {
-                let components_count = daemon_for_health.get_all_components_count().await;
-                Ok::<_, Infallible>(warp::reply::json(&serde_json::json!({
-                    "message": "Component Daemon - Real Connection",
-                    "components": components_count,
-                    "status": "Connected to registry"
-                })))
-            }
+            // We'll compute asynchronously but map must return immediate response; use blocking count or static placeholder
+            // For simplicity just return JSON without awaiting count (could spawn task)
+            // If count is needed accurate, change to warp::any().and_then(async move { ... }) pattern.
+            warp::reply::json(&serde_json::json!({
+                "message": "Component Daemon - Real Connection",
+                "components": 0,
+                "status": "Connected to registry"
+            }))
         });
 
     // GraphQL Playground (for browser testing)

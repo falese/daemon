@@ -67,6 +67,15 @@
     </details>
   </div>
   <script>
+    // Global error reporter to surface real parse/runtime errors
+    window.addEventListener('error', function(e){
+      try {
+        const dbg = document.getElementById('debug');
+        if (dbg) {
+          dbg.textContent += "\n[window.onerror] " + (e.message||'error') + ' at ' + (e.filename||'') + ':' + (e.lineno||'');
+        }
+      } catch(_){}
+    });
     // =============================
     // Transport / Subscription Setup
     // =============================
@@ -77,6 +86,17 @@
     const emptyDiv = document.getElementById('empty');
     const snapshotInfo = document.getElementById('snapshotInfo');
 
+    // Delegate click handling for action buttons (avoids repeated listener attachment)
+    componentsDiv.addEventListener('click', (e) => {
+      const btn = e.target.closest('.action-btn');
+      if (!btn) return;
+      const compId = btn.getAttribute('data-comp-id');
+      const idx = parseInt(btn.getAttribute('data-index'), 10);
+      const txt = btn.getAttribute('data-text');
+      const actionType = btn.getAttribute('data-action-type') || 'CLICK';
+      sendAction(compId, actionType, { buttonIndex: idx, text: txt });
+    });
+
     const WS_PROTOCOL = 'graphql-transport-ws';
     const SUB_QUERY = `subscription DaemonMessages {\n  messages {\n    direction\n    kind\n    payload\n    metadata { correlationId acknowledged error }\n  }\n}`;
 
@@ -86,7 +106,7 @@
 
     let ws; let reconnectTimer; let reconnectAttempts = 0;
 
-    function status(state, text){
+    function setStatus(state, text){
       statusDot.className = 'dot ' + state; statusText.textContent = text; }
 
     function logDebug(obj){
@@ -97,15 +117,17 @@
     function connect(){
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const url = proto + '://' + location.hostname + ':3001/graphql';
-      status('connecting','Connecting…');
+      setStatus('connecting','Connecting…');
       ws = new WebSocket(url, WS_PROTOCOL);
       ws.onopen = () => {
-        reconnectAttempts = 0; status('connected','Connected');
+        reconnectAttempts = 0; setStatus('connected','Connected');
         ws.send(JSON.stringify({ type:'connection_init'}));
       };
-      ws.onclose = () => { status('disconnected','Disconnected'); scheduleReconnect(); };
-      ws.onerror = () => { status('disconnected','Error'); };
-      ws.onmessage = evt => handleWs(JSON.parse(evt.data));
+      ws.onclose = () => { setStatus('disconnected','Disconnected'); scheduleReconnect(); };
+      ws.onerror = () => { setStatus('disconnected','Error'); };
+      ws.onmessage = evt => {
+        try { handleWs(JSON.parse(evt.data)); } catch(parseErr){ logDebug(['parse error', String(parseErr)]); }
+      };
     }
 
     function scheduleReconnect(){
@@ -120,7 +142,7 @@
           ws.send(JSON.stringify({ id:'daemon-msg-sub', type:'subscribe', payload:{ query: SUB_QUERY } }));
           break;
         case 'next':
-          if(msg.payload?.data?.messages){
+          if(msg.payload && msg.payload.data && msg.payload.data.messages){
             handleDaemonEnvelope(msg.payload.data.messages);
           }
           break;
@@ -141,15 +163,15 @@
     // =============================
     function handleDaemonEnvelope(env){
       logDebug(env);
-      if(env.direction === 'COMPONENT'){
+      if(env && env.direction === 'COMPONENT'){
         if(env.kind === 'STATE_SNAPSHOT'){
           applySnapshot(env.payload);
         } else if(env.kind === 'COMPONENT_UPDATE'){ upsertComponent(env.payload); }
-        else { // legacy or unspecified treat as component
-          if(env.payload?.id && env.payload?.type) upsertComponent(env.payload);
+        else {
+          if(env.payload && env.payload.id && env.payload.type) upsertComponent(env.payload);
         }
-      } else if(env.direction === 'ACTION' && env.kind === 'ACTION_ECHO'){
-        const actId = env.payload?.id; if(actId) { actionAcks.add(actId); highlightAck(actId); }
+      } else if(env && env.direction === 'ACTION' && env.kind === 'ACTION_ECHO'){
+        const actId = env.payload && env.payload.id; if(actId) { actionAcks.add(actId); highlightAck(actId); }
       }
       render();
     }
@@ -164,8 +186,8 @@
     }
 
     function upsertComponent(comp){
-      // Defensive decode if content is serialized JSON
-      if(comp?.data?.content && typeof comp.data.content === 'string' && comp.data.content.trim().startsWith('{')){
+      if(!comp) return;
+      if(comp.data && comp.data.content && typeof comp.data.content === 'string' && comp.data.content.trim().startsWith('{')){
         try { comp.data.content = JSON.parse(comp.data.content); } catch {}
       }
       componentStore.set(comp.id, comp);
@@ -192,7 +214,14 @@
       wrap.className = 'panel component-' + (comp.type || '').toLowerCase();
       wrap.setAttribute('data-component-id', comp.id);
       switch(comp.type){
-        case 'CARD': wrap.innerHTML = tplCard(comp); break;
+        case 'CARD':
+          wrap.innerHTML = tplCard(comp);
+          // Card surface click (excluding buttons) => CLICK
+          wrap.addEventListener('click', (ev) => {
+            if (ev.target.closest('.action-btn')) return; // ignore button clicks
+            sendAction(comp.id, 'CLICK', { timestamp: new Date().toISOString() });
+          });
+          break;
         case 'NOTIFICATION': wrap.innerHTML = tplNotification(comp); break;
         case 'FORM': wrap.innerHTML = tplForm(comp); break;
         default: wrap.innerHTML = tplDefault(comp); break;
@@ -201,8 +230,13 @@
     }
 
     function tplCard(comp){
-      const d = comp.data || {}; const buttons = (d.buttons||[]).map((b,i)=>`<button class="btn secondary" onclick="sendAction('${comp.id}','CLICK',{ buttonIndex:${i}, text:${JSON.stringify(b.text||'')} })">${escapeHtml(b.text||'Action')}</button>`).join('');
-      const contentHtml = typeof d.content === 'object' ? `<pre>${escapeHtml(JSON.stringify(d.content,null,2))}</pre>` : escapeHtml(d.content || '');
+      const d = comp.data || {};
+      const buttons = (d.buttons||[]).map((b,i)=>
+        `<button class="btn secondary action-btn" data-comp-id="${comp.id}" data-index="${i}" data-action-type="BUTTON_CLICK" data-text="${escapeHtml(b.text||'Action')}">${escapeHtml(b.text||'Action')}</button>`
+      ).join('');
+      const contentHtml = typeof d.content === 'object'
+        ? `<pre>${escapeHtml(JSON.stringify(d.content,null,2))}</pre>`
+        : escapeHtml(d.content || '');
       return `<div class="card-title">${escapeHtml(d.title||'Card')}</div>
               <div class="card-subtitle">${escapeHtml(d.subtitle||'')}</div>
               <div class="card-content">${contentHtml}</div>

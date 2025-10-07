@@ -14,6 +14,27 @@ const WebSocket = require('ws');
 const GraphQLJSON = require('graphql-type-json');
 const { execute, subscribe } = require('graphql');
 
+// Standardized logger (Node daemon) 😈
+const logger = (() => {
+  const icon = '😈';
+  const forceJson = process.env.LOG_JSON === '1';
+  function base(fields){ return Object.assign({ svc:'daemon-node', icon }, fields||{}); }
+  function out(level, obj, msg){
+    const rec = { ts:new Date().toISOString(), level, ...base(obj), msg };
+    if (forceJson) {
+      console.log(JSON.stringify(rec));
+    } else {
+      const main = `${rec.ts} ${icon} ${level.toUpperCase()} ${rec.code||''} ${rec.event||''}`.trim();
+      const extras = Object.entries(rec)
+        .filter(([k]) => !['ts','level','svc','icon','code','event','msg'].includes(k))
+        .map(([k,v]) => `${k}=${v}`)
+        .join(' ');
+      console.log(`${main} - ${msg}${extras? ' | '+extras:''}`);
+    }
+  }
+  return { info:(o,m)=>out('info',o,m), warn:(o,m)=>out('warn',o,m), error:(o,m)=>out('error',o,m) };
+})();
+
 // --- Constants / Enums ---
 const WS_SUBPROTOCOL = 'graphql-transport-ws';
 const MessageDirection = Object.freeze({ COMPONENT: 'COMPONENT', ACTION: 'ACTION' });
@@ -37,27 +58,38 @@ class ComponentDaemon {
     const host = process.env.REGISTRY_HOST || 'registry';
     const port = process.env.REGISTRY_PORT || '4000';
     const url = `ws://${host}:${port}/graphql`;
+    logger.info({ code:'DAE-201', event:'WS_REGISTRY_CONNECT', url, attempt:this.registryReconnectAttempt }, 'Connecting to registry');
     const ws = new WebSocket(url, WS_SUBPROTOCOL);
     this.registrySocket = ws;
 
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'connection_init' }));
+    ws.onopen = () => { logger.info({ code:'DAE-202', event:'WS_REGISTRY_OPEN', url }, 'Registry socket open'); ws.send(JSON.stringify({ type: 'connection_init' })); };
 
     ws.onmessage = (evt) => {
       let msg; try { msg = JSON.parse(evt.data); } catch { return; }
       switch (msg.type) {
         case 'connection_ack':
+          logger.info({ code:'DAE-202', event:'WS_REGISTRY_ACK' }, 'Registry connection acknowledged');
           ws.send(JSON.stringify({ id: 'registry-sub', type: 'subscribe', payload: { query: 'subscription { componentUpdate { id type data createdAt } }' } }));
           break;
         case 'next': {
-          const comp = msg.payload?.data?.componentUpdate; if (comp) this.handleComponentFromRegistry(comp); break; }
-        case 'ping': ws.send(JSON.stringify({ type: 'pong' })); break;
+          const comp = msg.payload && msg.payload.data && msg.payload.data.componentUpdate;
+          if (comp) { logger.info({ code:'DAE-210', event:'COMPONENT_FROM_REGISTRY', compId:comp.id }, 'Component from registry'); this.handleComponentFromRegistry(comp); }
+          break; }
+        case 'ping': logger.info({ code:'DAE-205', event:'WS_PING' }, 'Ping from registry'); ws.send(JSON.stringify({ type: 'pong' })); break;
+        case 'error': logger.error({ code:'DAE-299', event:'WS_REGISTRY_ERROR', raw:JSON.stringify(msg.payload||{}) }, 'Registry WS error frame'); break;
+        default: /* ignore */ break;
       }
     };
 
     ws.onclose = () => {
       if (this.stopping) return;
       const delay = Math.min(5000, 400 * Math.pow(1.6, this.registryReconnectAttempt++));
+      logger.warn({ code:'DAE-240', event:'WS_REGISTRY_CLOSED', nextDelay:delay }, 'Registry socket closed, scheduling reconnect');
       setTimeout(() => this.connectToRegistry(), delay);
+    };
+
+    ws.onerror = (err) => {
+      logger.error({ code:'DAE-299', event:'WS_REGISTRY_SOCKET_ERROR', error: err && err.message }, 'Registry socket error');
     };
   }
 
@@ -71,6 +103,13 @@ class ComponentDaemon {
 
   async handleAction(envelope) {
     const action = envelope.payload;
+    logger.info({ code:'DAE-220', event:'ACTION_RECEIVED', actionId:action.id, compId:action.componentId, actionType:action.actionType }, 'Action received');
+    // Normalize BUTTON_CLICK to CLICK (retain original)
+    if (action.actionType === 'BUTTON_CLICK') {
+      action.originalActionType = 'BUTTON_CLICK';
+      action.actionType = 'CLICK';
+      logger.info({ code:'DAE-224', event:'ACTION_NORMALIZED', actionId:action.id, compId:action.componentId }, 'Normalized BUTTON_CLICK to CLICK');
+    }
     const state = this.componentState.get(action.componentId);
     if (state) { state.actions.push(action); state.lastUpdated = new Date().toISOString(); }
 
@@ -82,6 +121,7 @@ class ComponentDaemon {
       metadata: { acknowledged: true, correlationId: (envelope.metadata && envelope.metadata.correlationId) || action.id, error: null }
     });
     this.publish(echo);
+    logger.info({ code:'DAE-221', event:'ACTION_ECHO_SENT', actionId:action.id, compId:action.componentId }, 'Action echo sent');
 
     // STATE_SNAPSHOT
     if (state) {
@@ -90,10 +130,14 @@ class ComponentDaemon {
         kind: MessageKind.STATE_SNAPSHOT,
         payload: { component: state.component, actions: state.actions, lastUpdated: state.lastUpdated }
       }));
+      logger.info({ code:'DAE-222', event:'STATE_SNAPSHOT_SENT', compId:action.componentId, actionsCount:state.actions.length }, 'State snapshot sent');
     }
 
     // Forward action to registry
-    this.forwardActionToRegistry(envelope).catch(()=>{});
+    logger.info({ code:'DAE-230', event:'ACTION_FORWARD_START', actionId:action.id }, 'Forwarding action to registry');
+    this.forwardActionToRegistry(envelope).catch(err=>{
+      logger.error({ code:'DAE-299', event:'ACTION_FORWARD_ERROR', error:err && err.message, actionId:action.id }, 'Action forward error');
+    });
     return echo;
   }
 
@@ -121,17 +165,22 @@ class ComponentDaemon {
     const host = process.env.REGISTRY_HOST || 'registry';
     const port = process.env.REGISTRY_PORT || '4000';
     const url = `ws://${host}:${port}/graphql`;
+    const opId = 'mutation-' + uuidv4();
     const ws = new WebSocket(url, WS_SUBPROTOCOL);
     const timer = setTimeout(() => { try { ws.close(); } catch(_){} }, 4000);
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'connection_init' }));
+    ws.onopen = () => { logger.info({ code:'DAE-231', event:'ACTION_FORWARD_WS_OPEN', opId }, 'Forward WS open'); ws.send(JSON.stringify({ type: 'connection_init' })); };
     ws.onmessage = (evt) => {
       let msg; try { msg = JSON.parse(evt.data); } catch { return; }
       if (msg.type === 'connection_ack') {
-        ws.send(JSON.stringify({ id: 'mutation-' + uuidv4(), type: 'subscribe', payload: { query: 'mutation($message:String!){ handleMessage(message:$message) }', variables: { message: JSON.stringify(envelope) } } }));
-      } else if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong' }));
-      else if (msg.type === 'complete') ws.close();
+        logger.info({ code:'DAE-231', event:'ACTION_FORWARD_ACK', opId }, 'Forward connection ack');
+        ws.send(JSON.stringify({ id: opId, type: 'subscribe', payload: { query: 'mutation($message:String!){ handleMessage(message:$message) }', variables: { message: JSON.stringify(envelope) } } }));
+      } else if (msg.type === 'ping') { logger.info({ code:'DAE-205', event:'FORWARD_WS_PING', opId }, 'Forward WS ping'); ws.send(JSON.stringify({ type: 'pong' })); }
+      else if (msg.type === 'next') { logger.info({ code:'DAE-232', event:'ACTION_FORWARD_RESULT', opId }, 'Forward mutation result'); }
+      else if (msg.type === 'complete') { logger.info({ code:'DAE-232', event:'ACTION_FORWARD_COMPLETE', opId }, 'Forward mutation complete'); ws.close(); }
+      else if (msg.type === 'error') { logger.error({ code:'DAE-299', event:'ACTION_FORWARD_GRAPHQL_ERROR', opId, raw:JSON.stringify(msg.payload||{}) }, 'Forward GraphQL error'); }
     };
-    ws.onclose = () => clearTimeout(timer);
+    ws.onclose = () => { clearTimeout(timer); logger.info({ code:'DAE-232', event:'ACTION_FORWARD_WS_CLOSE', opId }, 'Forward WS closed'); };
+    ws.onerror = (err) => { logger.error({ code:'DAE-299', event:'ACTION_FORWARD_WS_ERROR', opId, error: err && err.message }, 'Forward WS socket error'); };
   }
 
   buildMessage({ direction, kind, payload, metadata }) {
@@ -187,11 +236,16 @@ async function startDaemon(port = 3001) {
   app.get('/', (_req, res) => res.json({ message: 'Component Daemon (Node parity)', components: daemon.getComponents().length, status: 'running' }));
 
   const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
-  useServer({ schema, execute, subscribe, context: () => ({ daemon }) }, wsServer);
+  useServer({ schema, execute, subscribe, context: () => ({ daemon }),
+    onConnect: () => logger.info({ code:'DAE-201', event:'WS_RENDERER_CONNECT' }, 'Renderer connected'),
+    onSubscribe: () => logger.info({ code:'DAE-201', event:'WS_RENDERER_SUBSCRIBE' }, 'Renderer subscription'),
+    onError: (_ctx,_msg,errors) => logger.error({ code:'DAE-299', event:'WS_RENDERER_ERROR', errors: (errors||[]).map(e=>e.message).join(';') }, 'Renderer WS error'),
+    onComplete: (_ctx,_msg) => logger.info({ code:'DAE-240', event:'WS_RENDERER_COMPLETE' }, 'Renderer operation complete')
+  }, wsServer);
 
   httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 Component Daemon running on http://0.0.0.0:${port}`);
-    console.log(`📡 GraphQL (HTTP+WS): http://0.0.0.0:${port}/graphql`);
+    logger.info({ code:'DAE-200', event:'STARTUP', port }, 'Daemon listening');
+    logger.info({ code:'DAE-201', event:'WS_REGISTRY_CONNECT_TARGET', registryHost: process.env.REGISTRY_HOST||'registry', registryPort: process.env.REGISTRY_PORT||'4000' }, 'Target registry');
   });
 
   return daemon;
