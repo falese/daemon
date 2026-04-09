@@ -1,123 +1,107 @@
-# Vibe Coded Slop Daemon
+# Control Plane Daemon — Teaching Demo
 
-A distributed, real-time component rendering system built with GraphQL, Rust, Node.js, and React. This architecture enables dynamic UI updates across multiple renderers through a high-performance daemon service.
+A minimal working example of a control plane: a daemon watches UI actions, routes them through a rules engine, and pushes back components to render.
 
-![Architecture](https://img.shields.io/badge/Architecture-Microservices-blue)
-![Rust](https://img.shields.io/badge/Rust-Daemon-orange)
-![GraphQL](https://img.shields.io/badge/GraphQL-Subscriptions-E10098)
-![React](https://img.shields.io/badge/React-Frontend-61DAFB)
-![Docker](https://img.shields.io/badge/Docker-Containers-2496ED)
+> See [SPEC.md](./SPEC.md) for the full protocol specification.
 
-## 🏗️ Architecture Overview
+---
 
-```
-┌─────────────────┐                   ┌─────────────────┐                   ┌─────────────────┐
-│   Component     │◄──── State ───────│   Component     │       WebSocket   │   Frontend      │
-│   Registry      │                   │   Daemon        │◄───────────────►  │   Renderer      │
-│   (Backend)     │                   │   (Middleware)  │    Components     │   (React App)   │
-│                 │                   │                 │     & Actions     │                 │
-│  • Manages      │                   │  • Maintains    │                   │  • Renders UI   │
-│    Components   │    Components     │    State        │                   │  • Handles      │
-│  • Rules Engine │─────────────────► │  • Message      │                   │    User Input   │
-│  • REST API     │                   │    Router       │                   │  • Processes    │
-│  • GraphQL      │                   │  • State        │                   │    Actions      │
-│    Publishing   │                   │    Machine      │                   │                 │
-└─────────────────┘                   └─────────────────┘                   └─────────────────┘
-      Port 4000                             Port 3001                           Port 3000
+## Quick Start
+
+```bash
+make build        # build all Docker images
+make all          # start the registry
+make stack        # interactively choose a daemon + renderer
 ```
 
-### Message Flow (High Level)
+Then open http://localhost:3000 (React renderer) or http://localhost:8081 (HTML renderer).
 
-1. User interacts with component in Renderer
-2. Action sent via WebSocket to Daemon
-3. Daemon updates internal state
-4. State sent to Registry
-5. Registry rules generate new component
-6. Component flows back through WebSocket
+---
 
-### State / Action Flow (Expanded Summary)
+## What You'll See
 
-1. User clicks button in Renderer
-2. Action sent to Daemon
-3. Daemon updates internal state
-4. State sent to Registry
-5. Registry rules generate new component
-6. Component flows back through system
+Once the stack is running, post a FORM component:
 
-## 📡 Core Data Flows
-
-This system has two primary real-time flows:
-
-1. Component Flow (Backend → Frontend): Registry generates/publishes components that propagate through a daemon to renderers.
-2. Action Flow (Frontend → Backend): User interactions become actions that travel back through the daemon to the registry, trigger rules, and cause new components.
-
-### 1. Component Flow (Registry → Daemon → Renderer)
-
-High-level:
-
-1. A component is created (REST `/render`, GraphQL `renderComponent`, or a rule firing).
-2. Registry stores state and publishes a GraphQL subscription event (`componentUpdate`).
-3. Daemon maintains a `graphql-transport-ws` subscription to `componentUpdate` and receives the component.
-4. Daemon caches component state and broadcasts it via its own GraphQL subscription endpoint to connected renderers.
-5. Renderer renders/updates UI.
-
-Sequence (ASCII):
-
-```
-Client (curl)          Registry                  Daemon                    Renderer
-     | POST /render --> |                         |                          |
-     |                  | store component         |                          |
-     |                  | publish componentUpdate |                          |
-     |                  | ---- subscription ----> |                          |
-     |                  |                         | cache & forward          |
-     |                  |                         | ---- subscription ---->  | render
+```bash
+make form
 ```
 
-Key Messages:
+A form appears in the renderer. Submit it (click "Send Message") and watch:
+- The action travels from renderer → daemon → registry
+- The registry rules engine evaluates the action against registered rules
+- The `form-submit` rule fires and generates a CARD component with the submitted data
+- The new CARD appears in the renderer — no page refresh needed
 
-- Registry → Daemon (WebSocket subscription event):
-  `{ direction: 'COMPONENT', payload: { id, type, data, createdAt } }`
-- Daemon → Renderer: Similar shape (through async-graphql subscription).
+This is the core teaching pattern: **renderer sends an action, the rules engine decides what to render next**.
 
-Correlating Logs:
+---
 
-- Registry: `📦 Registry: Publishing new component <id>`
-- Daemon: `📦 Daemon: Received component from registry: <id>` (or custom log message) then `📦 Daemon: Forwarding component ...`
-- Renderer (if logging): `📦 Renderer: Received component` (React/HTML implementation dependent)
-
-Troubleshooting Component Flow:
-
-- No components at renderer: Ensure renderer connected to daemon WebSocket (browser console / network tab).
-- Daemon not receiving: Check daemon logs for successful `connection_ack` and `Sent subscribe` lines.
-- Registry publishing but daemon silent: Verify subprotocol `graphql-transport-ws` and that no disconnect loops occur (WS code 1006 hints at protocol mismatch).
-
-### 2. Action Flow (Renderer → Daemon → Registry → New Component)
-
-High-level:
-
-1. User interacts with a rendered component (e.g., submits a FORM or clicks button).
-2. Renderer sends an ACTION message to the daemon (UI → daemon GraphQL mutation or WS depending on renderer implementation).
-3. Daemon updates local state (adds action to component state).
-4. Daemon forwards the original ACTION to Registry using a one-off GraphQL WebSocket mutation `handleMessage(message: String!)` (current implementation opens a short-lived mutation WS, waits for `connection_ack`, sends mutation, waits for `next`/`complete`).
-5. Registry receives the message, identifies it as `ACTION`, loads current component state, runs rule set.
-6. Matching rule(s) generate new component(s); registry publishes them (Component Flow resumes for those components).
-
-Sequence (ASCII):
+## Architecture
 
 ```
-User UI          Renderer            Daemon                    Registry                Daemon (sub)         Renderer
-  | click/submit |                   |                         |                       |                     |
-  | -- ACTION -->| (send to daemon)  | handle_action()         |                       |                     |
-  |              | ----------------> | cache + spawn mutation  |                       |                     |
-  |              |                   | -- WS connect --------> |                       |                     |
-  |              |                   | connection_init         |                       |                     |
-  |              |                   | <--- connection_ack ----|                       |                     |
-  |              |                   | send handleMessage      |                       |                     |
-  |              |                   | ----------------------->| handleAction + rules  |                     |
-  |              |                   |                         | publish component ----|--> sub event ------>| render
+┌─────────────┐  subscription   ┌─────────────┐  subscription   ┌─────────────┐
+│  Registry   │ ──────────────► │    Daemon   │ ──────────────► │  Renderer   │
+│  :4000      │                 │    :3001    │                 │  :3000/8081 │
+│             │ ◄────────────── │             │ ◄────────────── │             │
+│  Rules +    │  handleMessage  │  Middleware │  sendMessage    │  UI         │
+│  State      │  mutation       │  + State    │  mutation       │             │
+└─────────────┘                 └─────────────┘                 └─────────────┘
 ```
 
-Action JSON (logical shape):
+All connections use the `graphql-transport-ws` subprotocol over WebSocket.
+
+### Service Roles
+
+| Service | Role |
+|---|---|
+| **Registry** (`registry/simple-registry.js`) | Stores component state, runs the rules engine, publishes `componentUpdate` subscriptions, exposes REST `POST /render` |
+| **Rust Daemon** (`daemon/rust/component-daemon/src/main.rs`) | High-performance middleware; subscribes to registry, broadcasts to renderers, forwards actions back to registry |
+| **Node Daemon** (`daemon/simple-daemon.js`) | Same role as Rust daemon — an alternative implementation to show the pattern isn't language-specific |
+| **React Renderer** (`renderer/frontend`) | Subscribes to daemon, renders CARD / FORM / NOTIFICATION components, sends user actions back via GraphQL mutation |
+| **HTML Renderer** (`renderer/html`) | Lightweight alternative renderer; plain HTML + JS, no build step |
+
+---
+
+## Data Flows
+
+### Component Flow: Registry → Daemon → Renderer
+
+```
+Client (curl)       Registry             Daemon               Renderer
+  | POST /render --> |                    |                    |
+  |                  | store component    |                    |
+  |                  | publish sub event  |                    |
+  |                  | ── subscription ──►|                    |
+  |                  |                    | cache & forward    |
+  |                  |                    | ── subscription ──►| render
+```
+
+1. A component is created via `POST /render`, a GraphQL mutation, or a rule firing.
+2. Registry publishes a `componentUpdate` subscription event.
+3. Daemon's persistent subscription receives the event and caches the component state.
+4. Daemon broadcasts the component over its own subscription to all connected renderers.
+5. Renderer updates the UI.
+
+### Action Flow: Renderer → Daemon → Registry → New Component
+
+```
+Renderer          Daemon                    Registry            Daemon (sub)     Renderer
+  | sendMessage ──►| cache action           |                   |                |
+  |                | open mutation WS ─────►|                   |                |
+  |                | connection_init        |                   |                |
+  |                | ◄─ connection_ack ─────|                   |                |
+  |                | handleMessage ────────►| run rules         |                |
+  |                |                        | publish ──────────►sub event ─────►| render
+```
+
+1. User interacts with a component (submit form, click button).
+2. Renderer sends an ACTION envelope to the daemon via `sendMessage` mutation.
+3. Daemon caches the action and opens a short-lived WebSocket to call `handleMessage` on the registry.
+   - A separate WS per mutation isolates failures and ensures `graphql-transport-ws` handshake.
+4. Registry loads component state, evaluates all registered rules.
+5. Matching rules generate new component(s); registry publishes them — Component Flow resumes.
+
+**Action envelope shape:**
 
 ```json
 {
@@ -125,303 +109,125 @@ Action JSON (logical shape):
   "payload": {
     "id": "action-<ts>",
     "componentId": "<component-id>",
-    "actionType": "SUBMIT|CLICK|...",
-    "data": {
-      /* form/button payload */
-    },
-    "timestamp": "2025-...Z"
+    "actionType": "SUBMIT",
+    "data": { "name": "Alice", "email": "alice@example.com" },
+    "timestamp": "2025-08-16T12:34:56.000Z"
   },
   "metadata": { "acknowledged": false, "correlationId": "...", "error": null }
 }
 ```
 
-Log Correlation (Happy Path SUBMIT):
+### Rules Engine
 
-1. Daemon: `[Daemon] Received ACTION message` (Rust log) / `Received ACTION`.
-2. Daemon: `Mutation WS connected for handleMessage`.
-3. Daemon: `Sending handleMessage mutation over WS (after ack)`.
-4. Registry: `📨 Registry GraphQL: Handling message` → `🎯 Registry: Processing action for component ...`.
-5. Registry: `🧪 Registry: Evaluating rules ...` → `🔍 Rule 'form-submit' condition => true` → `✨ Rule 'form-submit' triggered`.
-6. Registry: `📦 Registry: Publishing new component <new-id>`.
-7. Daemon: `📦 Daemon: Received component from registry: <new-id>`.
-8. Renderer: new component appears.
+Rules live in `ComponentRegistry` as a `Map<string, Rule>` where each rule is:
 
-Common Failure Points & Remedies:
-
-| Symptom                                            | Likely Cause                                       | Fix                                                                                                 |
-| -------------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Registry logs show action but `No rules triggered` | Rule condition mismatch (e.g., wrong `actionType`) | Confirm `actionType` string & component type casing                                                 |
-| Registry never logs `Processing action`            | Mutation not sent / WS failed                      | Check daemon mutation logs & ensure connection_ack before send                                      |
-| WS code 1006 right after mutation send             | GraphQL parse error (double braces)                | Ensure mutation is `mutation handleMessage($message: String!) { handleMessage(message: $message) }` |
-| Rule triggers but renderer silent                  | Daemon not forwarding subscription event           | Check daemon subscription still active (no reconnect spam)                                          |
-| Multiple duplicate components                      | Action retried or form posted multiple times       | Deduplicate in renderer or add idempotency (future enhancement)                                     |
-
-### Deep Dive: Why a Separate Mutation WS per Action?
-
-Current design opens a short-lived WebSocket for each action mutation to guarantee protocol parity (`graphql-transport-ws`) and isolate failures. Potential optimizations:
-
-- Reuse existing subscription connection for mutations (spec supports queries/mutations over same session).
-- Batch actions and send via a queue + single persistent mutation channel.
-- Add ack message back to renderer to reflect processing completion.
-
-### Future Enhancements (Suggested)
-
-- Correlation/Ack Flow: Registry returns a success payload → daemon updates metadata. Renderer displays processing status.
-- Rule Introspection Endpoint: `query { rules { name description firedCount } }` for monitoring.
-- Metrics: Counters for actions processed and components generated (Prometheus endpoint).
-- Persistence: Optional durable store for components/actions to survive restarts.
-- Security: API keys or auth tokens on WebSocket connection_init payload.
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Docker and Docker Compose
-- Modern web browser (for accessing renderers)
-- curl (for testing)
-
-### Installation
-
-1. **Clone the repository:**
-
-   ```bash
-   git clone <repository-url>
-   cd daemon
-   ```
-
-2. **Build images (optional first run clean build):**
-
-```bash
-docker compose build --no-cache
+```js
+{
+  condition: (state, action) => boolean,  // should this rule fire?
+  generate:  (state, action) => ComponentSpec  // what component to create?
+}
 ```
 
-3. **Start services (choose ONE daemon):**
+Default rules:
 
-Rust daemon stack:
+| Rule | Condition | Generates |
+|---|---|---|
+| `card-click` | CARD component + CLICK action | NOTIFICATION |
+| `form-submit` | FORM component + SUBMIT action | CARD with submitted data |
+
+Run the unit tests to see them in isolation:
 
 ```bash
-docker compose up -d registry rust-daemon react-renderer
+make test
+# or: cd component-system/registry && npm test
 ```
 
-Node daemon stack:
+---
+
+## Testing the System
+
+### Post a FORM and trigger rules (the main demo)
 
 ```bash
-docker compose up -d registry node-daemon react-renderer
-```
+# Step 1: post a FORM component
+make form
 
-> Both daemons bind port 3001. Do NOT run them simultaneously unless you change one to a different host port.
-
-Optional renderers / html:
-
-```bash
-docker compose up -d html-renderer
-```
-
-4. **Verify:**
-
-```bash
-curl http://localhost:4000/   # registry
-curl http://localhost:3001/   # active daemon (rust OR node)
-```
-
-Open http://localhost:3000 for the React renderer.
-
-5. **Switching daemons:**
-
-```bash
-docker compose stop rust-daemon
-# or docker compose stop node-daemon
-# then start the other
-```
-
-### Verifying the System
-
-After starting a stack:
-
-```bash
-docker compose ps
-docker compose logs -f rust-daemon   # or node-daemon
-```
-
-Look for WebSocket handshake sequence:
-`connection_init` → `connection_ack` → `subscribe` → `next` frames.
-
-You should see:
-
-- ✅ Registry: Service ready on port 4000
-- ✅ Rust Daemon: Connected to registry
-- ✅ Node Daemon: Connected to registry
-- ✅ React Renderer: WebSocket connection established
-- ✅ HTML Renderer: Server running
-
-## 🧪 Testing the System
-
-### Basic Component Rendering
-
-Send a card component:
-
-```bash
-curl -X POST http://localhost:4000/render \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "CARD",
-    "data": {
-      "title": "Hello World! 👋",
-      "content": "This component traveled: Registry → Daemon → Renderer",
-      "buttons": [
-        {"text": "Awesome! 🎉"},
-        {"text": "Send Another ✨"}
-      ]
-    }
-  }'
-```
-
-### Notification Component
-
-Send a success notification:
-
-```bash
-curl -X POST http://localhost:4000/render \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "NOTIFICATION",
-    "data": {
-      "type": "SUCCESS",
-      "title": "System Working! ✅",
-      "message": "Your GraphQL component flow is operational!"
-    }
-  }'
-```
-
-### Form Component
-
-Send a dynamic form:
-
-```bash
-curl -X POST http://localhost:4000/render \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "FORM",
-    "data": {
-      "title": "Contact Form 📝",
-      "fields": [
-        {"name": "name", "label": "Your Name", "type": "text"},
-        {"name": "email", "label": "Email Address", "type": "email"},
-        {"name": "message", "label": "Message", "type": "text"}
-      ],
-      "submitText": "Send Message 🚀"
-    }
-  }'
-```
-
-### Error Notification
-
-Send an error notification:
-
-```bash
-curl -X POST http://localhost:4000/render \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "NOTIFICATION",
-    "data": {
-      "type": "ERROR",
-      "title": "Oops! ❌",
-      "message": "Something went wrong, but the system is still working!"
-    }
-  }'
-```
-
-### Submitting an Action (Trigger Rules)
-
-After creating a FORM component you can simulate a user SUBMIT action to trigger registry rules (which generate a CARD component from the submitted data).
-
-1. List current components and locate the FORM component id:
-
-```bash
+# Step 2: get the FORM component id
 curl -s -X POST http://localhost:4000/graphql \
   -H 'Content-Type: application/json' \
-  -d '{"query":"query { components { id type } }"}' | jq -r '.data.components[] | select(.type=="FORM") | .id'
+  -d '{"query":"query { components { id type } }"}' \
+  | jq -r '.data.components[] | select(.type=="FORM") | .id'
+
+# Step 3: send a SUBMIT action (replace <id> with the value above)
+make action FORM_ID=<id>
 ```
 
-2. Export the id (replace with the value you saw):
+Or use the `make action` shortcut which builds the full envelope automatically.
+
+### Watch the log sequence
 
 ```bash
-FORM_ID="<form-id-here>"
+# Terminal 1 — registry rule evaluation
+make rules-logs
+
+# Terminal 2 — all services
+make logs
 ```
 
-3. Send the SUBMIT action to the Rust daemon (which forwards via handleMessage mutation to the registry):
+Expected log sequence for a SUBMIT action:
+1. Daemon: `Received ACTION message`
+2. Daemon: `Mutation WS connected for handleMessage`
+3. Registry: `Handling message` → `Processing action`
+4. Registry: `Evaluating rules` → `Rule 'form-submit' triggered`
+5. Registry: `Publishing new component <new-id>`
+6. Daemon: `Received component from registry: <new-id>`
+7. Renderer: new CARD appears
+
+### Post other component types directly
 
 ```bash
-curl -X POST http://localhost:3001/graphql \
-  -H 'Content-Type: application/json' \
-  -d "{\"query\":\"mutation($m:String!){sendMessage(message:$m)}\",\"variables\":{\"m\":\"{\\\"direction\\\":\\\"ACTION\\\",\\\"payload\\\":{\\\"id\\\":\\\"action-$(date +%s)\\\",\\\"componentId\\\":\\\"$FORM_ID\\\",\\\"actionType\\\":\\\"SUBMIT\\\",\\\"data\\\":{\\\"name\\\":\\\"Alice\\\",\\\"email\\\":\\\"alice@example.com\\\",\\\"message\\\":\\\"Hello Registry!\\\"},\\\"timestamp\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"},\\\"metadata\\\":{\\\"acknowledged\\\":false,\\\"correlationId\\\":\\\"manual-test\\\",\\\"error\\\":null}}\"}}"
+# CARD with clickable buttons
+curl -X POST http://localhost:4000/render \
+  -H "Content-Type: application/json" \
+  -d '{"type":"CARD","data":{"title":"Hello","content":"A card component","buttons":[{"text":"Click me"}]}}'
+
+# NOTIFICATION
+curl -X POST http://localhost:4000/render \
+  -H "Content-Type: application/json" \
+  -d '{"type":"NOTIFICATION","data":{"status":"SUCCESS","title":"It works","message":"Component flow is operational"}}'
 ```
 
-4. Watch logs (separate terminals):
+---
 
-```bash
-# Registry rule evaluation & component generation
-docker compose logs -f registry | egrep 'Registry: (Handling message|Processing action|Evaluating rules|Rule|Publishing new component|No rules triggered)'
-
-# Daemon action flow & mutation forwarding
-docker compose logs -f rust-daemon | egrep 'Received ACTION|Mutation WS|Sending handleMessage'
-```
-
-Expected sequence:
-
-- Daemon logs: Received ACTION, Mutation WS connected, mutation sent, received complete (or close after result)
-- Registry logs: Handling message, Processing action, Evaluating rules, Rule 'form-submit' triggered, Publishing new component
-- Renderer displays new CARD component containing submitted data
-
-Troubleshooting:
-
-- If no rule triggers: ensure FORM_ID matches an active FORM component
-- If registry shows no handleMessage lines: confirm daemon action curl succeeded and daemon container is running
-- If WS closes with code 1006 before mutation: check that mutation braces are single ( `mutation handleMessage($message: String!) { handleMessage ... }` )
-
-## 🏛️ Component Types
+## Component Types
 
 ### CARD
-
-Interactive card component with title, content, and buttons.
-
-**Structure:**
 
 ```json
 {
   "type": "CARD",
   "data": {
     "title": "Card Title",
-    "content": "Card description text",
-    "buttons": [{ "text": "Button Text", "action": "ACTION_NAME" }]
+    "content": "Description text",
+    "buttons": [{ "text": "Button Label", "action": "ACTION_NAME" }]
   }
 }
 ```
 
 ### NOTIFICATION
 
-Status messages with different types and styling.
-
-**Structure:**
-
 ```json
 {
   "type": "NOTIFICATION",
   "data": {
-    "type": "SUCCESS|ERROR|WARNING|INFO",
+    "status": "SUCCESS | ERROR | WARNING | INFO",
     "title": "Notification Title",
-    "message": "Notification message",
-    "dismissible": true,
-    "autoRemove": 5000
+    "message": "Notification message"
   }
 }
 ```
 
 ### FORM
-
-Dynamic forms with configurable fields.
-
-**Structure:**
 
 ```json
 {
@@ -429,164 +235,36 @@ Dynamic forms with configurable fields.
   "data": {
     "title": "Form Title",
     "fields": [
-      {
-        "name": "fieldName",
-        "label": "Field Label",
-        "type": "text|email|password",
-        "placeholder": "Placeholder text"
-      }
+      { "name": "fieldName", "label": "Field Label", "type": "text | email | password" }
     ],
-    "submitText": "Submit Button Text"
+    "submitText": "Submit"
   }
 }
 ```
 
-## 🔧 Architecture Deep Dive
+---
 
-### Service Roles
+## Configuration
 
-1. **Registry (`registry/simple-registry.js`)**
+| Variable | Default | Description |
+|---|---|---|
+| `REGISTRY_URL` | `ws://registry:4000/graphql` | Registry WebSocket endpoint (daemon config) |
+| `COMPONENT_TTL_MS` | `600000` (10 min) | How long the registry keeps a component in memory |
+| `LOG_JSON` | unset | Set to `1` for structured JSON logs from the Node daemon |
+| `PORT` | `3001` | Daemon HTTP/WS port |
 
-   - Node.js service managing component lifecycle
-   - GraphQL subscriptions for real-time updates
-   - REST API for component creation
-   - In-memory component management
-   - Runs in Docker container on port 4000
+Both daemons bind to port 3001 inside Docker. The `docker-compose.yml` maps the Rust daemon to host port `3001` and the Node daemon to host port `3002`, so you **can** run both simultaneously — they just serve from different host ports.
 
-2. **Rust Daemon (`daemon/rust/component-daemon/src/main.rs`)**
+---
 
-   - High-performance component processor
-   - Written in Rust using Warp and async-graphql
-   - Subscribes to registry updates
-   - Routes components to renderers
-   - Runs in Docker container on port 3001
+## Troubleshooting
 
-3. **Node Daemon (`daemon/simple-daemon.js`)**
-
-   - Alternative daemon implementation in Node.js
-   - Same functionality as Rust daemon
-   - Demonstrates technology flexibility
-   - Runs in Docker container on port 3001
-
-4. **React Renderer (`renderer/frontend`)**
-
-   - Dynamic component rendering
-   - Real-time updates via WebSocket
-   - Modern UI with animations
-   - Runs in Docker container on port 3000
-
-5. **HTML Renderer (`renderer/html`)**
-   - Static HTML rendering alternative
-   - Lightweight deployment option
-   - Basic component display
-   - Runs in Docker container on port 8081
-
-**Key Features:**
-
-- `POST /render` - Create and publish components
-- GraphQL subscription `componentUpdate` - Real-time component stream
-- Auto-cleanup and TTL support
-
-### Component Daemon (`simple-daemon.js`)
-
-**Purpose**: Middleware that bridges registry and frontend
-
-- **Registry Client**: Subscribes to registry component updates
-- **Frontend Server**: Provides GraphQL API for frontend clients
-- **Message Forwarding**: Relays components from registry to frontend
-- **Connection Management**: Handles reconnections and error recovery
-
-**Key Features:**
-
-- WebSocket connection to registry GraphQL API
-- GraphQL subscription server for frontend clients
-- Real-time message forwarding
-- Health monitoring and reconnection logic
-
-### Frontend Renderer (React App)
-
-**Purpose**: Pure UI rendering system
-
-- **GraphQL Client**: Connects to daemon via WebSocket
-- **Component Rendering**: Dynamic UI generation based on component data
-- **Real-time Updates**: Live component updates without page refresh
-- **Beautiful UI**: Modern glassmorphism design with animations
-
-**Key Features:**
-
-- WebSocket GraphQL subscription client
-- Dynamic component type resolution
-- Responsive design with animations
-- Connection status monitoring
-
-## 🌐 API Reference
-
-### Active Subscription (Renderer ↔ Daemon)
-
-```graphql
-subscription {
-  messages {
-    direction
-    kind
-    payload
-    metadata {
-      acknowledged
-      correlationId
-      error
-    }
-  }
-}
-```
-
-### Mutation (Send a Message)
-
-```graphql
-mutation SendMessage($m: String!) {
-  sendMessage(message: $m)
-}
-```
-
-`$m` is a JSON string of the envelope (ACTION or COMPONENT) matching the daemon schema.
-
-### Example ACTION Envelope
-
-```json
-{
-  "direction": "ACTION",
-  "payload": {
-    "id": "action-1734469900000",
-    "componentId": "<component-id>",
-    "actionType": "CLICK",
-    "data": { "foo": "bar" },
-    "timestamp": "2025-08-16T12:34:56.000Z"
-  },
-  "metadata": {
-    "acknowledged": false,
-    "correlationId": "action-1734469900000",
-    "error": null
-  }
-}
-```
-
-(Older docs showing `message { ... }` or extra fields like `origin/target/timestamp` at top level are deprecated.)
-
-## 🔍 Troubleshooting (Updated)
-
-| Symptom                        | Cause                                           | Fix                                                                  |
-| ------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------- |
-| WS close code 1006 immediately | Protocol mismatch or both daemons bound to 3001 | Ensure only one daemon; client subprotocol is `graphql-transport-ws` |
-| No `connection_ack`            | Registry/daemon not listening or network issue  | Check container logs, port 3001 open                                 |
-| ACTION_ECHO missing            | Component id unknown to daemon                  | Ensure component exists before sending action                        |
-| STATE_SNAPSHOT missing         | Action for unknown component                    | Same as above; create component first                                |
-| Duplicate components           | Rapid rule re-fires / repeated actions          | Add client-side de-duplication (id set)                              |
-| No rule trigger                | Rule predicate false                            | Check actionType & component.type match rule expectations            |
-
-## ✨ Key Features
-
-- **🔄 Real-time Component Delivery**: Components appear instantly via GraphQL subscriptions
-- **🎨 Dynamic UI Generation**: Backend services can create UI components on-demand
-- **🔧 Middleware Architecture**: Clean separation between backend and frontend
-- **📱 Technology Agnostic**: Backend can be any language, frontend can be any framework
-- **🚀 Scalable**: Multiple daemons and frontends can connect to same registry
-- **💫 Beautiful UI**: Modern glassmorphism design with animations
-- **Unified WebSocket protocol**: `graphql-transport-ws` across Registry, Daemons, Renderer.
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| WS close code 1006 immediately | Protocol mismatch | Confirm client uses `graphql-transport-ws` subprotocol |
+| No `connection_ack` from registry | Registry not running or network issue | `make logs-registry`; check port 4000 is reachable |
+| Daemon not receiving components | Subscription disconnected | Check daemon logs for reconnect loop; WS 1006 hints at subprotocol mismatch |
+| `No rules triggered` in registry logs | Rule condition not matched | Confirm `actionType` string and `component.type` match rule expectations (case-sensitive) |
+| Registry shows action but daemon silent | Mutation WS failed | Check daemon logs for `Mutation WS` lines; ensure `connection_ack` was received before mutation |
+| Renderer shows no components | Not connected to daemon | Open browser console; look for WebSocket errors on port 3001 |
+| Duplicate components in renderer | Rapid re-fires or repeated form posts | Add client-side deduplication by component id |

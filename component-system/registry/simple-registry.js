@@ -1,8 +1,16 @@
 // ========================
-// SIMPLE COMPONENT REGISTRY
-// Backend that publishes components via GraphQL subscription
+// COMPONENT REGISTRY
 // ========================
-
+// Role in the system:
+//   - Stores the state of every active component (component + its action history)
+//   - Evaluates rules when an action arrives and generates new components
+//   - Publishes component updates via GraphQL subscription so the daemon can
+//     pick them up and forward them to connected renderers
+//
+// Ports / endpoints:
+//   POST /render          – inject a component directly (used by Makefile `make form`)
+//   POST /graphql         – GraphQL over HTTP (queries + mutations)
+//   WS   /graphql         – GraphQL over WebSocket (subscriptions, graphql-transport-ws)
 
 import { ApolloServer } from 'apollo-server-express';
 import { createServer } from 'http';
@@ -11,8 +19,11 @@ import { makeExecutableSchema } from '@graphql-tools/schema';
 import { PubSub } from 'graphql-subscriptions';
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { execute, subscribe } from 'graphql';
 import { WebSocketServer } from 'ws';
+
+// How long a component stays in memory before being evicted.
+// Keeps the in-memory store from growing forever in a long-running demo.
+const COMPONENT_TTL_MS = parseInt(process.env.COMPONENT_TTL_MS || '600000', 10); // default 10 min
 
 // ========================
 // REGISTRY
@@ -20,35 +31,39 @@ import { WebSocketServer } from 'ws';
 
 class ComponentRegistry {
   constructor() {
-    this.components = new Map(); // Stores current component states
-    this.rules = new Map(); // Stores component generation rules
+    this.components = new Map(); // id -> { component, actions: [], lastUpdated }
+    this.rules = new Map();      // ruleName -> { condition(state, action), generate(state, action) }
     this.pubsub = new PubSub();
-    
-    // Initialize default rules
+
     this.setupDefaultRules();
   }
 
+  // ── Rules ─────────────────────────────────────────────────────────────────
+  // Each rule has:
+  //   condition(state, action) → boolean   — should this rule fire?
+  //   generate(state, action)  → { type, data }  — what component to create?
+
   setupDefaultRules() {
-    // Rule: When a card receives a 'click' action, create a notification
+    // Rule: clicking a CARD produces a NOTIFICATION
     this.rules.set('card-click', {
-      condition: (state, action) => 
-        state.component.type === 'CARD' && 
+      condition: (state, action) =>
+        state.component.type === 'CARD' &&
         action.actionType === 'CLICK',
-      generate: (state, action) => ({
+      generate: (state, _action) => ({
         type: 'NOTIFICATION',
         data: {
-          message: `Card ${state.component.id} was clicked!`,
-          type: 'INFO'
+          message: `Card "${state.component.data?.title || state.component.id}" was clicked!`,
+          status: 'INFO'
         }
       })
     });
 
-    // Rule: When a form is submitted, create a card with the form data
+    // Rule: submitting a FORM produces a CARD summarising the submitted data
     this.rules.set('form-submit', {
       condition: (state, action) =>
         state.component.type === 'FORM' &&
         action.actionType === 'SUBMIT',
-      generate: (state, action) => ({
+      generate: (_state, action) => ({
         type: 'CARD',
         data: {
           title: 'Form Submission',
@@ -59,65 +74,93 @@ class ComponentRegistry {
     });
   }
 
+  // ── Message dispatch ───────────────────────────────────────────────────────
+
   handleMessage(message) {
-    console.log(`📨 Registry: Handling message of type ${message.direction}`);
-    
+    // Validate the envelope before dispatching
+    if (!message || typeof message !== 'object' || !message.direction) {
+      console.warn('⚠️  Registry: Received malformed message (missing direction), ignoring');
+      return null;
+    }
+
+    console.log(`📨 Registry: Handling message direction=${message.direction}`);
+
     if (message.direction === 'ACTION') {
       return this.handleAction(message);
     } else if (message.direction === 'COMPONENT') {
       return this.updateComponentState(message);
+    } else {
+      console.warn(`⚠️  Registry: Unknown message direction "${message.direction}", ignoring`);
+      return null;
     }
   }
 
+  // ── Action handling + rule evaluation ─────────────────────────────────────
+
   async handleAction(message) {
     const action = message.payload;
-    console.log(`🎯 Registry: Processing action for component ${action.componentId}`);
+    console.log(`🎯 Registry: Processing action componentId=${action.componentId} actionType=${action.actionType}`);
 
     const state = this.components.get(action.componentId);
     if (!state) {
-      console.warn(`⚠️ Registry: No state found for component ${action.componentId} (cannot evaluate rules)`);
+      console.warn(`⚠️  Registry: No state for component ${action.componentId} — rules cannot be evaluated`);
       return null;
     }
 
-    console.log(`🧪 Registry: Evaluating rules for component type=${state.component.type} actionType=${action.actionType}`);
+    console.log(`🧪 Registry: Evaluating ${this.rules.size} rule(s) for type=${state.component.type} action=${action.actionType}`);
     let triggered = false;
+
     for (const [ruleName, rule] of this.rules) {
-      let conditionResult = false;
+      // Step 1: test the condition (errors are caught so one bad rule doesn't block the rest)
+      let conditionMet = false;
       try {
-        conditionResult = rule.condition(state, action);
+        conditionMet = rule.condition(state, action);
       } catch (e) {
-        console.error(`❌ Registry: Rule '${ruleName}' threw error:`, e);
+        console.error(`❌ Registry: Rule "${ruleName}" condition threw:`, e.message);
+        continue;
       }
-      console.log(`🔍 Registry: Rule '${ruleName}' condition => ${conditionResult}`);
-      if (conditionResult) {
-        triggered = true;
-        console.log(`✨ Registry: Rule '${ruleName}' triggered`);
-        const componentSpec = rule.generate(state, action) || {};
-        // Attach rule evaluation metadata into component data (namespaced)
-        componentSpec.data = Object.assign({}, componentSpec.data || {}, {
-          _ruleEvaluation: {
-            rule: ruleName,
-            facts: {
-              componentId: state.component.id,
-              componentType: state.component.type,
-              actionId: action.id,
-              actionType: action.actionType,
-              actionDataKeys: Object.keys(action.data || {})
-            },
-            result: 'TRIGGERED',
-            timestamp: new Date().toISOString()
-          }
-        });
-        await this.renderComponent(componentSpec);
+
+      console.log(`🔍 Registry: Rule "${ruleName}" → ${conditionMet ? 'MATCH' : 'no match'}`);
+      if (!conditionMet) continue;
+
+      // Step 2: generate the new component (errors are caught separately)
+      let componentSpec;
+      try {
+        componentSpec = rule.generate(state, action);
+      } catch (e) {
+        console.error(`❌ Registry: Rule "${ruleName}" generate() threw:`, e.message);
+        continue;
       }
+
+      // Attach rule evaluation metadata so the renderer can show which rule fired
+      componentSpec.data = Object.assign({}, componentSpec.data || {}, {
+        _ruleEvaluation: {
+          rule: ruleName,
+          facts: {
+            componentId: state.component.id,
+            componentType: state.component.type,
+            actionId: action.id,
+            actionType: action.actionType
+          },
+          timestamp: new Date().toISOString()
+        }
+      });
+
+      console.log(`✨ Registry: Rule "${ruleName}" triggered — publishing ${componentSpec.type} component`);
+      await this.renderComponent(componentSpec);
+      triggered = true;
     }
+
     if (!triggered) {
-      console.log(`🚫 Registry: No rules triggered for actionType=${action.actionType} on component ${action.componentId}`);
+      console.log(`🚫 Registry: No rules matched (actionType=${action.actionType} componentType=${state.component.type})`);
     }
 
     return true;
   }
 
+  // ── Component state ────────────────────────────────────────────────────────
+
+  // Called by the daemon when it sends a COMPONENT-direction message (state sync)
   updateComponentState(message) {
     const state = message.payload;
     console.log(`📝 Registry: Updating state for component ${state.component.id}`);
@@ -125,6 +168,7 @@ class ComponentRegistry {
     return true;
   }
 
+  // Create a new component, store it, schedule its eviction, and publish it
   renderComponent({ type, data }) {
     const component = {
       id: uuidv4(),
@@ -133,7 +177,6 @@ class ComponentRegistry {
       createdAt: new Date().toISOString()
     };
 
-    // Initialize component state
     const state = {
       component,
       actions: [],
@@ -141,28 +184,21 @@ class ComponentRegistry {
     };
 
     this.components.set(component.id, state);
-    console.log(`📦 Registry: Publishing new component ${component.id}`);
 
-    // Publish as a component message
-    const message = {
-      direction: 'COMPONENT',
-      payload: component,
-      metadata: {
-        acknowledged: false,
-        correlationId: uuidv4(),
-        error: null
-      }
-    };
+    // Evict after TTL so the in-memory store doesn't grow forever
+    setTimeout(() => this.components.delete(component.id), COMPONENT_TTL_MS);
 
-    this.pubsub.publish('COMPONENT_UPDATE', {
-      componentUpdate: component
-    });
+    console.log(`📦 Registry: Publishing component id=${component.id} type=${component.type}`);
+
+    // Publish on the COMPONENT_UPDATE channel — the daemon's persistent
+    // subscription will pick this up and forward it to all connected renderers
+    this.pubsub.publish('COMPONENT_UPDATE', { componentUpdate: component });
 
     return component;
   }
 
   getComponents() {
-    return Array.from(this.components.values()).map(state => state.component);
+    return Array.from(this.components.values()).map(s => s.component);
   }
 
   getComponentStates() {
@@ -183,30 +219,17 @@ const typeDefs = `
   }
 
   type Mutation {
+    # Inject a component directly (type = CARD | NOTIFICATION | FORM)
     renderComponent(type: ComponentType!, data: JSON!): Component!
+
+    # Route a message envelope from the daemon (direction = ACTION | COMPONENT)
     handleMessage(message: String!): Boolean!
   }
 
   type Subscription {
+    # Fires whenever renderComponent() or a rule generates a new component.
+    # The daemon subscribes here and forwards updates to all renderers.
     componentUpdate: Component!
-    messages: Message!
-  }
-
-  type Message {
-    direction: MessageDirection!
-    payload: JSON!
-    metadata: MessageMetadata
-  }
-
-  enum MessageDirection {
-    COMPONENT
-    ACTION
-  }
-
-  type MessageMetadata {
-    acknowledged: Boolean!
-    correlationId: String
-    error: String
   }
 
   type Component {
@@ -250,25 +273,23 @@ function createResolvers(registry) {
 
     Mutation: {
       renderComponent: (_, { type, data }) => {
-        console.log(`🎨 Registry GraphQL: Rendering ${type} component`);
+        console.log(`🎨 Registry: renderComponent type=${type}`);
         return registry.renderComponent({ type, data });
       },
       handleMessage: async (_, { message }) => {
-        console.log(`📨 Registry GraphQL: Handling message`);
-        const msg = JSON.parse(message);
-        return registry.handleMessage(msg);
+        let parsed;
+        try {
+          parsed = JSON.parse(message);
+        } catch {
+          throw new Error('handleMessage: message must be a valid JSON string');
+        }
+        return registry.handleMessage(parsed);
       }
     },
 
     Subscription: {
       componentUpdate: {
         subscribe: () => registry.pubsub.asyncIterableIterator('COMPONENT_UPDATE')
-      },
-      messages: {
-        subscribe: () => {
-          console.log('📡 Registry: Client subscribed to messages');
-          return registry.pubsub.asyncIterableIterator('MESSAGE');
-        }
       }
     }
   };
@@ -286,120 +307,69 @@ async function startRegistry(port = 4000) {
 
   app.use(express.json());
 
-  // REST endpoint for testing
+  // REST: inject a component directly — used by `make form`
   app.post('/render', (req, res) => {
-    console.log('📨 Registry REST: Received render request', req.body);
     const { type, data } = req.body;
     const component = registry.renderComponent({ type, data });
     res.json({ success: true, component });
   });
 
-  // Debug endpoint to test subscription
-  app.post('/test-subscription', (req, res) => {
-    console.log('🧪 Registry: Testing subscription publish...');
-    registry.pubsub.publish('COMPONENT_UPDATE', {
-      componentUpdate: {
-        id: 'test-' + Date.now(),
-        type: 'NOTIFICATION',
-        data: { message: 'Test message from debug endpoint' },
-        createdAt: new Date().toISOString()
-      }
-    });
-    res.json({ message: 'Test subscription event published' });
-  });
-
   // Health check
-  app.get('/', (req, res) => {
+  app.get('/', (_req, res) => {
     res.json({
-      message: 'Component Registry',
+      service: 'control-plane-registry',
       components: registry.getComponents().length,
-      endpoints: {
-        'GraphQL': '/graphql',
-        'REST': '/render'
-      }
+      endpoints: { GraphQL: '/graphql', REST: '/render' }
     });
   });
 
-  // GraphQL setup
-  const schema = makeExecutableSchema({
-    typeDefs,
-    resolvers: createResolvers(registry)
-  });
+  const schema = makeExecutableSchema({ typeDefs, resolvers: createResolvers(registry) });
 
-  const server = new ApolloServer({ 
-    schema,
-    context: () => ({ registry })
-  });
-  
+  const server = new ApolloServer({ schema, context: () => ({ registry }) });
   await server.start();
   server.applyMiddleware({ app, path: '/graphql' });
 
-  // Modern graphql-ws server (supports queries/mutations/subscriptions over WS)
-  const wsServer = new WebSocketServer({
-    server: httpServer,
-    path: '/graphql'
+  // WebSocket server (graphql-transport-ws protocol)
+  const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
+
+  // Debug: log the raw WS protocol header on each new connection so you can
+  // confirm the daemon is using 'graphql-transport-ws'. The graphql-ws library
+  // takes over handling from here — this listener is read-only observation.
+  wsServer.on('connection', (_socket, req) => {
+    console.log('🔌 Registry: WS connection, protocol:', req.headers['sec-websocket-protocol']);
   });
-  wsServer.on('connection', (socket, req) => {
-    console.log('🔌 Registry: WS raw protocols header:', req.headers['sec-websocket-protocol']);
-    socket.on('message', (data, isBinary) => {
-      try {
-        const text = isBinary ? data : data.toString();
-        console.log('🛰️ Registry: WS raw message received:', text);
-      } catch (e) {
-        console.error('❌ Registry: Error logging raw message', e);
-      }
-    });
-    socket.on('close', (code, reason) => {
-      console.log(`🔌 Registry: WS connection closed code=${code} reason=${reason}`);
-    });
-    socket.on('error', (err) => {
-      console.error('❌ Registry: WS socket error', err);
-    });
-  });
+
   useServer({
     schema,
     context: () => ({ registry }),
     onConnect: (ctx) => {
-      console.log('🔌 Registry: Client connected (graphql transport)', ctx.extra.request.headers['sec-websocket-protocol']);
+      console.log('🔌 Registry: graphql-ws client connected from', ctx.extra.request.socket.remoteAddress);
     },
     onDisconnect: () => {
-      console.log('🔌 Registry: Client disconnected (graphql transport)');
+      console.log('🔌 Registry: graphql-ws client disconnected');
     },
-    onSubscribe: (ctx, msg) => {
-      console.log('📡 Registry: onSubscribe payload:', JSON.stringify(msg));
-    },
-    onNext: (ctx, msg, args, result) => {
-      console.log('📡 Registry: onNext sending result');
-    },
-    onError: (ctx, msg, errors) => {
-      console.error('❌ Registry: onError', errors);
-    },
-    onComplete: (ctx, msg) => {
-      console.log('📡 Registry: onComplete for operation', msg.id);
+    onError: (_ctx, _msg, errors) => {
+      console.error('❌ Registry: graphql-ws error:', errors);
     }
   }, wsServer);
 
   httpServer.listen(resolvedPort, '0.0.0.0', () => {
-    console.log(`🚀 Component Registry running on http://0.0.0.0:${resolvedPort}`);
-    console.log(`📡 GraphQL: http://0.0.0.0:${resolvedPort}/graphql`);
-    console.log(`🔌 REST: http://0.0.0.0:${resolvedPort}/render`);
+    console.log(`🚀 Registry listening on http://0.0.0.0:${resolvedPort}`);
+    console.log(`   GraphQL: http://0.0.0.0:${resolvedPort}/graphql`);
+    console.log(`   REST:    http://0.0.0.0:${resolvedPort}/render`);
   });
 
-  // Send a test component after startup
+  // Publish a startup notification so the renderer shows something immediately
   setTimeout(() => {
-    console.log('📦 Registry: Sending startup test component...');
+    console.log('📦 Registry: Publishing startup notification...');
     registry.renderComponent({
       type: 'NOTIFICATION',
-      data: {
-        message: 'Registry is active and ready!',
-        type: 'SUCCESS'
-      }
+      data: { message: 'Registry is active and ready!', status: 'SUCCESS' }
     });
   }, 3000);
 
   return registry;
 }
-
 
 // ESM entrypoint
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -409,4 +379,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   });
 }
 
-export { startRegistry };
+export { startRegistry, ComponentRegistry };

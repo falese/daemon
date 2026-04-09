@@ -6,7 +6,7 @@ SERVICES = registry rust-daemon node-daemon react-renderer html-renderer
 # =====================
 # High-level Targets
 # =====================
-.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action clean ps lint lint-rust lint-node prune images
+.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images
 
 help:
 	@echo "Available targets:"; \
@@ -30,14 +30,14 @@ help:
 	 echo "  make clean            Stop and remove containers + volumes"; \
 	 echo "  make prune            Prune dangling images"; \
 	 echo "  make images           List project images"; \
-	 echo "  make lint             Run all lint tasks (placeholders)";
+	 echo "  make test             Run unit tests (registry rules engine)";
 
 all: build up
 
 build:
 	$(DOCKER_COMPOSE) build
 
-# Start only registry by default for quicker interactive startup
+# Start registry only — use 'make stack' to add a daemon and renderer interactively
 up: registry
 
 ps:
@@ -102,14 +102,9 @@ action:
 	  -H 'Content-Type: application/json' \
 	  -d "{\"query\":\"mutation($$m:String!){sendMessage(message:$$m)}\",\"variables\":{\"m\":\"{\\\"direction\\\":\\\"ACTION\\\",\\\"payload\\\":{\\\"id\\\":\\\"action-$$(date +%s)\\\",\\\"componentId\\\":\\\"$(FORM_ID)\\\",\\\"actionType\\\":\\\"SUBMIT\\\",\\\"data\\\":{\\\"name\\\":\\\"Alice\\\",\\\"email\\\":\\\"alice@example.com\\\",\\\"message\\\":\\\"Hello Registry!\\\"},\\\"timestamp\\\":\\\"$$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"},\\\"metadata\\\":{\\\"acknowledged\\\":false,\\\"correlationId\\\":\\\"make-action\\\",\\\"error\\\":null}}\"}}" | jq '.'
 
-# Lint placeholders (extend as needed)
-lint: lint-rust lint-node
-
-lint-rust:
-	@echo "(rust lint placeholder) Run cargo fmt/clippy inside container or locally"
-
-lint-node:
-	@echo "(node lint placeholder) Run npm run lint inside respective service"
+test:
+	@echo "Running registry unit tests..."; \
+	cd component-system/registry && npm test
 
 clean:
 	$(DOCKER_COMPOSE) down -v

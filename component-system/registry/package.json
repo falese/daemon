@@ -1,14 +1,18 @@
 {
-  "name": "registry",
+  "name": "control-plane-registry",
   "type": "module",
   "version": "1.0.0",
+  "description": "Rules engine and component store for the control plane daemon demo",
   "main": "simple-registry.js",
   "scripts": {
-    "start": "node simple-registry.js"
+    "start": "node simple-registry.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
-  "author": "",
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {}
+  },
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "@graphql-tools/schema": "^10.0.25",
     "apollo-server-express": "^3.13.0",
@@ -18,5 +22,8 @@
     "graphql-ws": "^6.0.6",
     "uuid": "^11.1.0",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
   }
 }
