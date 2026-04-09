@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# create-issues.sh
+# Creates all tracked GitHub issues for falese/daemon
+#
+# Usage:
+#   export GITHUB_TOKEN=<your-token>
+#   ./create-issues.sh
+#
+# Requires: curl, jq
+
+set -euo pipefail
+
+REPO="falese/daemon"
+API="https://api.github.com/repos/${REPO}/issues"
+
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  echo "Error: GITHUB_TOKEN environment variable is not set."
+  exit 1
+fi
+
+create_issue() {
+  local title="$1"
+  local body="$2"
+  local labels="$3"
+
+  echo "Creating: $title"
+  curl -s -X POST "$API" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github.v3+json" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n \
+      --arg title "$title" \
+      --arg body "$body" \
+      --argjson labels "$(echo "$labels" | jq -R 'split(",")')" \
+      '{title: $title, body: $body, labels: $labels}')" \
+    | jq -r '.html_url // "failed"'
+}
+
+# ─── PRIORITY 1: Critical Fixes ───────────────────────────────────────────────
+
+create_issue \
+  "bug: Registry component store grows unbounded (memory leak)" \
+  "## Problem
+The \`ComponentRegistry\` class in \`component-system/registry/simple-registry.js\` stores all components in a \`Map\` and never removes them. Over time this will exhaust memory.
+
+## Location
+\`component-system/registry/simple-registry.js\` — \`this.components\` Map
+
+## Fix
+Add a TTL-based eviction policy. When a component is created, schedule its removal after a configurable TTL (e.g. \`COMPONENT_TTL_MS\`, default 10 minutes). Also cap the max store size.
+
+\`\`\`js
+const TTL_MS = parseInt(process.env.COMPONENT_TTL_MS || '600000');
+// on component create:
+setTimeout(() => this.components.delete(id), TTL_MS);
+\`\`\`" \
+  "bug,priority:high,registry"
+
+create_issue \
+  "bug: Hard-coded 3-second timeout for mutation WebSocket in Rust daemon" \
+  "## Problem
+In \`component-system/daemon/rust/component-daemon/src/main.rs\`, the fire-and-forget mutation that forwards actions to the Registry uses a hard-coded 3-second timeout. Slow registries will silently drop actions.
+
+## Location
+\`src/main.rs\` — mutation spawner (around line 317)
+
+## Fix
+Move timeout to an environment variable:
+\`\`\`rust
+let timeout_ms = std::env::var(\"MUTATION_TIMEOUT_MS\")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(3000u64);
+\`\`\`" \
+  "bug,priority:high,rust-daemon"
+
+create_issue \
+  "bug: \`require('graphql').parse\` called inside async handler (Node.js daemon)" \
+  "## Problem
+In \`component-system/daemon/simple-daemon.js\` line ~233, \`require('graphql').parse()\` is called inside an async message handler on every invocation. The module should be imported once at the top of the file.
+
+## Location
+\`component-system/daemon/simple-daemon.js\` — inside \`forwardActionToRegistry\`
+
+## Fix
+Move to top of file:
+\`\`\`js
+const { parse } = require('graphql');
+\`\`\`" \
+  "bug,priority:high,node-daemon"
+
+create_issue \
+  "bug: \`log_event!\` macro defined but never used in Rust daemon" \
+  "## Problem
+\`src/main.rs\` line ~20 defines a \`log_event!\` macro but all actual logging uses \`tracing\` macros directly. The dead macro adds confusion.
+
+## Location
+\`component-system/daemon/rust/component-daemon/src/main.rs\`
+
+## Fix
+Remove the unused macro definition. Use \`tracing::{info, warn, error}\` consistently throughout." \
+  "bug,priority:medium,rust-daemon,cleanup"
+
+create_issue \
+  "bug: No input validation on GraphQL mutations in Registry or Daemon" \
+  "## Problem
+Neither the Registry nor the Node.js Daemon validate incoming mutation arguments. Malformed \`ComponentType\`, missing required fields, or oversized payloads pass through unchecked and cause runtime errors or undefined behaviour.
+
+## Location
+- \`component-system/registry/simple-registry.js\` — \`renderComponent\` resolver
+- \`component-system/daemon/simple-daemon.js\` — \`sendAction\` resolver
+
+## Fix
+Add resolver-level validation before processing:
+- Validate \`type\` is a known \`ComponentType\` enum value
+- Validate \`data\` is an object (not null, not array)
+- Return a descriptive GraphQL error on failure" \
+  "bug,priority:high,registry,node-daemon,security"
+
+# ─── PRIORITY 2: Architecture / Design ────────────────────────────────────────
+
+create_issue \
+  "arch: Implement end-to-end correlationId tracking" \
+  "## Problem
+The message envelope has a \`correlationId\` field but it is not reliably propagated. Actions from the renderer arrive at the Daemon with a \`correlationId\`, but when the Daemon forwards to the Registry via \`handleMessage\`, the ID may be lost or re-generated.
+
+## Goal
+A single \`correlationId\` (UUID generated at the renderer) should flow unchanged through:
+\`Renderer → Daemon → Registry → Rule Result Component → Daemon → Renderer\`
+
+This enables end-to-end tracing and deduplication.
+
+## Changes Required
+1. Registry \`handleMessage\` resolver must accept and store \`correlationId\`
+2. Registry should attach \`correlationId\` to any components generated by rules
+3. Daemon must pass \`correlationId\` in the forwarded mutation
+4. Renderer should log the round-trip on \`correlationId\` match" \
+  "architecture,priority:high"
+
+create_issue \
+  "arch: Add backpressure handling on Rust daemon broadcast channel" \
+  "## Problem
+The Rust daemon uses \`tokio::broadcast\` to fan out components to renderers. If a renderer is slow to consume, the broadcast channel can overflow and messages are silently dropped. There is currently no backpressure or error surfacing for this case.
+
+## Location
+\`component-system/daemon/rust/component-daemon/src/main.rs\` — broadcast channel setup
+
+## Fix
+- Increase channel capacity from default to a configurable value (\`BROADCAST_CAPACITY\`)
+- Log a warning when \`send\` returns \`RecvError::Lagged\`
+- Consider per-subscriber queuing if drop-free delivery is required" \
+  "architecture,priority:medium,rust-daemon"
+
+create_issue \
+  "arch: Define canonical daemon implementation (Node.js vs Rust)" \
+  "## Problem
+Two daemon implementations exist with slightly different behaviour (e.g. Rust injects \`_originalActionType\`, Node.js does not; subprotocol validation only in Rust). This creates maintenance burden and inconsistency.
+
+## Decision Needed
+Pick one implementation as **canonical** and document the other as **experimental** or remove it.
+
+## Recommendation
+Keep Node.js as the reference implementation (easier to read, modify, and test). The Rust daemon should either be brought fully in sync or moved to a separate \`experimental/\` directory with a note in the README." \
+  "architecture,priority:medium,decision"
+
+create_issue \
+  "arch: Extract all hard-coded values to environment configuration" \
+  "## Problem
+Several values are hard-coded in source:
+- Rust: 3s mutation timeout, broadcast channel capacity
+- Node.js Daemon: reconnect max attempts (implicit), action history cap (50)
+- React: reconnect max attempts (5), action history cap (50)
+
+## Fix
+Document all tunables in \`SPEC.md\` and read them from environment variables with sensible defaults. Validate them at startup and log their effective values." \
+  "architecture,priority:medium,config"
+
+create_issue \
+  "arch: Standardize WebSocket subprotocol validation across both daemons" \
+  "## Problem
+The Rust daemon validates the \`graphql-transport-ws\` subprotocol on incoming connections. The Node.js daemon does not, meaning non-compliant clients can connect without error.
+
+## Fix
+Add subprotocol validation in \`simple-daemon.js\` matching the Rust behaviour. Reject connections that do not advertise \`graphql-transport-ws\`." \
+  "architecture,priority:medium,node-daemon"
+
+# ─── PRIORITY 3: Features for Demo Goal ──────────────────────────────────────
+
+create_issue \
+  "feat: Send STATE_SNAPSHOT to renderer on WebSocket connect" \
+  "## Problem
+When a new renderer connects to the Daemon, it receives no initial state. It must wait for the next \`componentUpdate\` event before seeing anything. This means a renderer that connects after components have been published sees an empty screen.
+
+## Expected Behaviour
+On WebSocket connection established, the Daemon should immediately send a \`STATE_SNAPSHOT\` message containing all current components and recent action history.
+
+## Location
+\`component-system/daemon/simple-daemon.js\` and \`src/main.rs\` — connection handler" \
+  "feature,priority:high,node-daemon,rust-daemon"
+
+create_issue \
+  "feat: Action deduplication in Daemon" \
+  "## Problem
+If a renderer sends the same action twice (e.g. due to retry on reconnect), the Daemon forwards it to the Registry twice, potentially triggering duplicate rule evaluations and duplicate components.
+
+## Fix
+Track recently processed action IDs (using \`correlationId\`) in a bounded LRU cache with a short TTL (e.g. 5 seconds). Discard duplicates and send \`ACTION_ECHO\` with a \`duplicate: true\` flag." \
+  "feature,priority:medium,node-daemon,rust-daemon"
+
+create_issue \
+  "feat: Renderer reconnect should request STATE_SNAPSHOT" \
+  "## Problem
+The React renderer reconnects after a disconnect but does not explicitly request a state snapshot. It relies on the next organic component update to populate the UI, which may never come.
+
+## Fix
+After reconnect, the renderer should send a \`requestSnapshot\` query or trigger a mutation so the Daemon sends a fresh \`STATE_SNAPSHOT\`." \
+  "feature,priority:medium,renderer"
+
+create_issue \
+  "feat: Add more rules to the Registry rules engine" \
+  "## Problem
+The Registry only has 2 built-in rules (\`card-click\` and \`form-submit\`). To demonstrate the control plane concept, more rules are needed showing:
+- Rules that chain (output of one rule triggers another)
+- Rules with conditions on action \`data\` payload
+- Rules that dismiss/remove a component
+
+## Implementation
+Add at least 2 more rules and document the rule API in \`SPEC.md\`." \
+  "feature,priority:medium,registry,demo"
+
+create_issue \
+  "feat: HTML renderer parity with React renderer" \
+  "## Problem
+The HTML renderer (\`component-system/renderer/html/index.html\`) is behind the React renderer in features: it does not display the connection status, does not show action history, and its WS URL resolution via query params is fragile.
+
+## Fix
+Bring the HTML renderer to feature parity and test it against both the Node.js and Rust daemons." \
+  "feature,priority:low,renderer"
+
+# ─── PRIORITY 4: Code Quality ─────────────────────────────────────────────────
+
+create_issue \
+  "test: Add unit tests for Registry rule evaluation" \
+  "## Problem
+There are zero tests for the Registry rule engine. The \`App.test.js\` file exists but is empty. Rule evaluation logic is the core of the demo and should be tested in isolation.
+
+## Needed
+- Unit tests for each default rule (condition and action functions)
+- Test that unknown component/action combinations produce no output
+- Test that rule errors are caught and do not crash the server" \
+  "testing,priority:high,registry"
+
+create_issue \
+  "test: Add integration test for full component round-trip" \
+  "## Problem
+No integration test verifies the full flow:
+\`POST /render → Registry → Daemon subscription → Renderer subscription\`
+
+## Approach
+Use \`ws\` + \`graphql-ws\` client in a test to:
+1. Subscribe to the Daemon \`messages\` subscription
+2. POST a component to the Registry
+3. Assert the message arrives at the Daemon subscription within 2 seconds" \
+  "testing,priority:high"
+
+create_issue \
+  "test: Add integration test for action → rule → component flow" \
+  "## Problem
+No test verifies the action round-trip:
+\`Daemon sendAction mutation → Registry handleMessage → rule fires → component pushed back to renderer\`
+
+## Approach
+Extend the integration test suite with a full action round-trip test using \`correlationId\` to match the outbound action to the inbound component." \
+  "testing,priority:high"
+
+create_issue \
+  "cleanup: Remove or document Procfile (Heroku deployment)" \
+  "## Problem
+A \`Procfile\` exists suggesting Heroku deployment, but the project uses Docker Compose. The Procfile may be stale and is not referenced anywhere in the README or Makefile.
+
+## Fix
+Either remove the Procfile or add a note to the README explaining how to deploy to Heroku." \
+  "cleanup,priority:low"
+
+create_issue \
+  "cleanup: Rename project from 'Vibe Coded Slop Daemon' to something descriptive" \
+  "## Problem
+The \`package.json\` files use the name \`vibe-coded-slop-daemon\`. This is not appropriate for a project intended to demonstrate a serious control plane concept.
+
+## Suggestion
+Rename to \`ui-control-plane-daemon\` or similar across all \`package.json\` files and the root README." \
+  "cleanup,priority:low"
+
+create_issue \
+  "docs: Create formal GraphQL schema files for Registry and Daemon" \
+  "## Problem
+The GraphQL schemas are defined inline as template literals in JavaScript files. There are no standalone \`.graphql\` schema files, making it hard to review the contract or generate client types.
+
+## Fix
+Extract schemas to \`registry/schema.graphql\` and \`daemon/schema.graphql\`. Reference them in the respective servers." \
+  "documentation,priority:medium"
+
+echo ""
+echo "Done. All issues created."
