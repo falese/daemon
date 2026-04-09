@@ -102,16 +102,18 @@
 
     // Local state
     const componentStore = new Map(); // id -> component
-    const actionAcks = new Set(); // echoed action ids
 
     let ws; let reconnectTimer; let reconnectAttempts = 0;
 
     function setStatus(state, text){
       statusDot.className = 'dot ' + state; statusText.textContent = text; }
 
+    const MAX_DEBUG_LINES = 400;
     function logDebug(obj){
-      const line = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
-      debugPre.textContent = (debugPre.textContent + '\n' + line).trim().split('\n').slice(-400).join('\n');
+      const line     = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+      const existing = debugPre.textContent;
+      const updated  = (existing + '\n' + line).trim().split('\n');
+      debugPre.textContent = updated.slice(-MAX_DEBUG_LINES).join('\n');
     }
 
     function resolveExplicitWs(){
@@ -198,7 +200,8 @@
           if(env.payload && env.payload.id && env.payload.type) upsertComponent(env.payload);
         }
       } else if(env && env.direction === 'ACTION' && env.kind === 'ACTION_ECHO'){
-        const actId = env.payload && env.payload.id; if(actId) { actionAcks.add(actId); highlightAck(actId); }
+        const actId = env.payload && env.payload.id;
+        if(actId) logDebug('Action echoed by daemon: ' + actId);
       }
       render();
     }
@@ -214,15 +217,15 @@
 
     function upsertComponent(comp){
       if(!comp) return;
-      if(comp.data && comp.data.content && typeof comp.data.content === 'string' && comp.data.content.trim().startsWith('{')){
-        try { comp.data.content = JSON.parse(comp.data.content); } catch {}
+      // If content looks like a JSON string, parse it for better display
+      if(comp.data && typeof comp.data.content === 'string' && comp.data.content.trim().startsWith('{')){
+        try {
+          comp.data.content = JSON.parse(comp.data.content);
+        } catch(e) {
+          logDebug('Note: content looks like JSON but failed to parse: ' + e.message);
+        }
       }
       componentStore.set(comp.id, comp);
-    }
-
-    function highlightAck(actionId){
-      // placeholder: could visually show acked action; no-op for now
-      logDebug(`Acked action ${actionId}`);
     }
 
     // =============================
