@@ -6,7 +6,7 @@ SERVICES = registry rust-daemon node-daemon react-renderer html-renderer
 # =====================
 # High-level Targets
 # =====================
-.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images
+.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images contracts-install contracts-build contracts-typecheck contracts-clean
 
 help:
 	@echo "Available targets:"; \
@@ -30,7 +30,9 @@ help:
 	 echo "  make clean            Stop and remove containers + volumes"; \
 	 echo "  make prune            Prune dangling images"; \
 	 echo "  make images           List project images"; \
-	 echo "  make test             Run unit tests (registry rules engine)";
+	 echo "  make test             Run unit tests (registry rules engine)"; \
+	 echo "  make contracts-build      Build @control-plane/contracts TypeScript package"; \
+	 echo "  make contracts-typecheck  Type-check contracts without emitting output";
 
 all: build up
 
@@ -114,6 +116,21 @@ prune:
 
 images:
 	docker images | grep daemon || true
+
+# =====================
+# Contracts package
+# =====================
+contracts-install:
+	cd contracts && npm install
+
+contracts-build: contracts-install
+	cd contracts && npm run build
+
+contracts-typecheck: contracts-install
+	cd contracts && npm run typecheck
+
+contracts-clean:
+	rm -rf contracts/dist contracts/node_modules
 
 down:
 	$(DOCKER_COMPOSE) down

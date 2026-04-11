@@ -1,0 +1,18 @@
+{
+  "name": "@control-plane/contracts",
+  "version": "1.0.0",
+  "description": "TypeScript abstract base class and shared types for control-plane daemon implementations",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "license": "ISC"
+}
