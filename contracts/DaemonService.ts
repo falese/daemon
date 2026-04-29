@@ -33,6 +33,7 @@ import {
   Component,
   ActionRecord,
   ComponentState,
+  SlotAssignment,
   Message,
   MessageDirection,
   MessageKind,
@@ -45,6 +46,7 @@ export type {
   Component,
   ActionRecord,
   ComponentState,
+  SlotAssignment,
   Message,
   MessageDirection,
   MessageKind,
@@ -74,6 +76,13 @@ export abstract class DaemonService {
 
   /** Live component cache: componentId → { component, actions, lastUpdated }. */
   protected componentState: Map<string, ComponentState> = new Map();
+
+  /**
+   * Authoritative slot map: parentComponentId → { slotName → childComponentId | null }.
+   * Only the daemon writes this map. Components declare slot names; the daemon decides
+   * what occupies each slot and broadcasts SLOT_ASSIGNMENT messages to renderers.
+   */
+  protected slotAssignments: Map<string, Map<string, string | null>> = new Map();
 
   /**
    * How many consecutive registry reconnect attempts have been made.
@@ -378,6 +387,84 @@ export abstract class DaemonService {
         lastUpdated: new Date().toISOString(),
       });
     }
+    this.resolveSlotAssignment(component);
+  }
+
+  /**
+   * If `component.data._slot` carries a routing directive, record the assignment
+   * in the slot map and publish a SLOT_ASSIGNMENT message.
+   *
+   * The `_slot` field is intent expressed by the Registry rules engine. The daemon
+   * enforces it by validating that:
+   *   1. The named parent component exists in the local cache.
+   *   2. The parent component declares the named slot in its `slots` array.
+   *
+   * Components that carry no `_slot` directive are silently ignored.
+   *
+   * WHY concrete: the slot-resolution algorithm is a fixed protocol rule — it
+   * must behave identically across all daemon implementations.
+   */
+  protected resolveSlotAssignment(component: Component): void {
+    const directive = component.data?._slot as { parentId?: string; slotName?: string } | undefined;
+    if (!directive?.parentId || !directive?.slotName) return;
+
+    const parent = this.componentState.get(directive.parentId)?.component;
+    if (!parent?.slots?.includes(directive.slotName)) return;
+
+    if (!this.slotAssignments.has(directive.parentId)) {
+      this.slotAssignments.set(directive.parentId, new Map());
+    }
+    this.slotAssignments.get(directive.parentId)!.set(directive.slotName, component.id);
+
+    this.publishSlotAssignment(directive.parentId, directive.slotName, component.id);
+  }
+
+  /**
+   * Build and publish a SLOT_ASSIGNMENT message.
+   * Call this both from resolveSlotAssignment (directive-driven) and from the
+   * assignSlot GraphQL mutation resolver (explicit external assignment).
+   */
+  protected publishSlotAssignment(
+    parentComponentId: string,
+    slotName: string,
+    childComponentId: string | null,
+  ): void {
+    const assignment: SlotAssignment = { parentComponentId, slotName, childComponentId };
+    this.publish(this.buildMessage({
+      direction: 'COMPONENT',
+      kind:      'SLOT_ASSIGNMENT',
+      payload:   assignment,
+    }));
+  }
+
+  /**
+   * Explicitly assign a child component to a named slot on a parent component.
+   * Exposed via the `assignSlot` GraphQL mutation so tests and admin tools can
+   * drive composition without needing a Registry rule.
+   *
+   * Returns false if the parent doesn't exist or doesn't declare the slot.
+   */
+  assignSlot(parentId: string, slotName: string, childId: string | null): boolean {
+    const parent = this.componentState.get(parentId)?.component;
+    if (!parent?.slots?.includes(slotName)) return false;
+
+    if (!this.slotAssignments.has(parentId)) {
+      this.slotAssignments.set(parentId, new Map());
+    }
+    this.slotAssignments.get(parentId)!.set(slotName, childId);
+    this.publishSlotAssignment(parentId, slotName, childId);
+    return true;
+  }
+
+  /** Return current slot assignments (for the GraphQL query resolver). */
+  getSlotAssignments(): SlotAssignment[] {
+    const result: SlotAssignment[] = [];
+    for (const [parentId, slots] of this.slotAssignments) {
+      for (const [slotName, childId] of slots) {
+        result.push({ parentComponentId: parentId, slotName, childComponentId: childId });
+      }
+    }
+    return result;
   }
 
   /** Return all cached components (used by the `components` GraphQL query resolver). */

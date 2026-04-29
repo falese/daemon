@@ -178,6 +178,7 @@ class ComponentDisplaySystem {
     this.graphqlClient = new GraphQLWebSocketClient();
     this.components = new Map();    // id -> component
     this.componentStates = new Map(); // id -> { component, actions, lastUpdated }
+    this.slotMap = new Map();       // parentId -> Map<slotName, component>
     this.actions = [];              // recent action echoes (capped at 50)
     this.subscribers = new Set();   // React state update callbacks
   }
@@ -206,6 +207,18 @@ class ComponentDisplaySystem {
   // component into the local store". Extract the component then upsert.
 
   handleComponentEnvelope(message) {
+    // SLOT_ASSIGNMENT: daemon tells us which component fills a named slot.
+    // Update slotMap only — do not add the child to the top-level component list.
+    if (message.kind === 'SLOT_ASSIGNMENT') {
+      const { parentComponentId, slotName, childComponentId } = message.payload;
+      if (!this.slotMap.has(parentComponentId))
+        this.slotMap.set(parentComponentId, new Map());
+      const child = childComponentId ? this.components.get(childComponentId) : null;
+      this.slotMap.get(parentComponentId).set(slotName, child);
+      this.notify({ type: 'components_changed' });
+      return;
+    }
+
     let component;
 
     if (message.kind === 'STATE_SNAPSHOT' && message.payload?.component) {
@@ -295,6 +308,14 @@ class ComponentDisplaySystem {
 
   getComponents()     { return Array.from(this.components.values()); }
   getRecentActions()  { return this.actions; }
+
+  // Returns a plain object { slotName: component | null } for a parent component.
+  // The renderer calls this to pass resolved slots as props — it never queries them itself.
+  getSlots(parentId) {
+    const slots = this.slotMap.get(parentId);
+    if (!slots) return {};
+    return Object.fromEntries(slots);
+  }
 }
 
 // Singleton — one connection shared across the whole app
@@ -382,13 +403,34 @@ const RuleEvaluation = ({ evalData }) => {
 };
 
 // ========================
+// SLOT RENDERER
+// ========================
+// Renders whatever component the daemon has assigned to a slot.
+// Receives the resolved component object (or null) — never queries for it.
+
+const SlotRenderer = ({ component, onAction }) => {
+  if (!component) {
+    return (
+      <div className="border border-dashed border-gray-300 rounded p-3 text-center text-gray-400 text-xs">
+        Empty slot
+      </div>
+    );
+  }
+  // eslint-disable-next-line no-use-before-define
+  const Renderer = UIRenderers[component.type];
+  if (!Renderer) return null;
+  return <Renderer data={component.data} componentId={component.id} onAction={onAction} slots={{}} />;
+};
+
+// ========================
 // UI COMPONENT RENDERERS
 // ========================
-// One renderer per component type. Each receives `data`, `componentId`, and
-// `onAction`. Call `onAction(componentId, actionType, data)` to send an action.
+// One renderer per component type. Each receives `data`, `componentId`, `onAction`,
+// and `slots` (a { [slotName]: component | null } object resolved by the daemon).
+// Renderers declare which slots they render; they never decide what fills them.
 
 const UIRenderers = {
-  CARD: ({ data, componentId, onAction }) => (
+  CARD: ({ data, componentId, onAction, slots = {} }) => (
     <div
       className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4 cursor-pointer hover:shadow-lg transition-shadow"
       onClick={() => onAction(componentId, 'CLICK', { timestamp: new Date().toISOString() })}
@@ -406,6 +448,12 @@ const UIRenderers = {
               {button.text}
             </button>
           ))}
+        </div>
+      )}
+      {data.slots?.includes('detail') && (
+        <div className="mt-4 border-t border-gray-100 pt-4">
+          <p className="text-[10px] font-semibold tracking-wide text-gray-400 uppercase mb-2">Detail slot</p>
+          <SlotRenderer component={slots.detail ?? null} onAction={onAction} />
         </div>
       )}
       <RuleEvaluation evalData={data._ruleEvaluation} />
@@ -523,9 +571,15 @@ export default function App() {
         {components.map(component => {
           const Renderer = UIRenderers[component.type];
           if (!Renderer) return null;
+          const slots = displaySystem.getSlots(component.id);
+          // Hide components that are assigned to a parent slot — they render inside their parent
+          const isSlotted = Array.from(displaySystem.slotMap.values()).some(
+            m => Array.from(m.values()).some(c => c?.id === component.id)
+          );
+          if (isSlotted) return null;
           return (
             <div key={component.id}>
-              <Renderer data={component.data} componentId={component.id} onAction={onAction} />
+              <Renderer data={component.data} componentId={component.id} onAction={onAction} slots={slots} />
             </div>
           );
         })}
