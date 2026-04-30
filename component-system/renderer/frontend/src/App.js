@@ -184,15 +184,19 @@ class ComponentDisplaySystem {
     this.graphqlClient = new GraphQLWebSocketClient();
     this.components = new Map();    // id -> component
     this.componentStates = new Map(); // id -> { component, actions, lastUpdated }
-    this.slotMap = new Map();       // parentId -> Map<slotName, component>
+    this.slotMap = new Map();       // parentId -> Map<slotName, childId | null>
     this.actions = [];              // recent action echoes (capped at 50)
     this.subscribers = new Set();   // React state update callbacks
+    // Stable references so repeated connect() calls (React StrictMode) don't
+    // register duplicate handlers on the singleton graphqlClient.
+    this._onComponent = msg => this.handleComponentEnvelope(msg);
+    this._onAction    = msg => this.handleActionEnvelope(msg);
   }
 
   async connect() {
-    // Register message handlers before opening the socket so no messages are missed
-    this.graphqlClient.onMessage('COMPONENT', msg => this.handleComponentEnvelope(msg));
-    this.graphqlClient.onMessage('ACTION',    msg => this.handleActionEnvelope(msg));
+    // onMessage uses a Set — stable references make this idempotent
+    this.graphqlClient.onMessage('COMPONENT', this._onComponent);
+    this.graphqlClient.onMessage('ACTION',    this._onAction);
 
     try {
       await this.graphqlClient.connect();
