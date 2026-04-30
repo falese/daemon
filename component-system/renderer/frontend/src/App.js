@@ -18,8 +18,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 //   sendMessage(envelope)          — send an action to the daemon
 
 class GraphQLWebSocketClient {
-  constructor(url = `ws://${window.location.hostname}:3001/graphql`) {
-    this.url = url;
+  constructor() {
+    // Port resolution order:
+    //   1. ?daemonPort=N  query param  (hot-switch without rebuild)
+    //   2. REACT_APP_DAEMON_PORT env var  (set in docker-compose or .env)
+    //   3. 3001  (rust-daemon default)
+    const qp = new URLSearchParams(window.location.search).get('daemonPort');
+    const port = qp || process.env.REACT_APP_DAEMON_PORT || '3001';
+    this.url = `ws://${window.location.hostname}:${port}/graphql`;
     this.ws = null;
     this.connected = false;
     this.reconnectAttempts = 0;
