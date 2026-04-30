@@ -362,6 +362,8 @@ const useComponentDisplay = () => {
             actions:    displaySystem.getRecentActions()
           }));
           break;
+        default:
+          break;
       }
     });
 
