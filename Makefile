@@ -1,12 +1,12 @@
 .DEFAULT_GOAL := help
 
 DOCKER_COMPOSE ?= docker compose
-SERVICES = registry rust-daemon node-daemon react-renderer html-renderer
+SERVICES = registry rust-daemon node-daemon react-renderer html-renderer ssr-renderer
 
 # =====================
 # High-level Targets
 # =====================
-.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images contracts-install contracts-build contracts-typecheck contracts-clean
+.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images contracts-install contracts-build contracts-typecheck contracts-clean ssr-renderer
 
 help:
 	@echo "Available targets:"; \
@@ -19,6 +19,7 @@ help:
 	 echo "  make node-daemon      Start Node daemon"; \
 	 echo "  make react-renderer   Start React renderer"; \
 	 echo "  make html-renderer    Start HTML renderer"; \
+	 echo "  make ssr-renderer     Start SSR renderer (port 3003, needs node-daemon)"; \
 	 echo "  make logs             Follow all logs"; \
 	 echo "  make logs-<svc>       Follow one service (e.g. logs-registry)"; \
 	 echo "  make rules-logs       Follow registry rules / action logs"; \

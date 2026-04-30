@@ -57,6 +57,22 @@ services:
     networks:
       - component-network
 
+  ssr-renderer:
+    build:
+      context: ./component-system/renderer/ssr
+      dockerfile: Dockerfile
+    ports:
+      - 3003:3003
+    environment:
+      # Server-side HTTP fetch — uses internal Docker network name
+      - DAEMON_HTTP_URL=http://node-daemon:3001/graphql
+      # Port the browser uses to reach the daemon WebSocket (host port mapping)
+      - PUBLIC_DAEMON_PORT=3002
+    depends_on:
+      - node-daemon
+    networks:
+      - component-network
+
 networks:
   component-network:
     driver: bridge
