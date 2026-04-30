@@ -219,8 +219,9 @@ class ComponentDisplaySystem {
       const { parentComponentId, slotName, childComponentId } = message.payload;
       if (!this.slotMap.has(parentComponentId))
         this.slotMap.set(parentComponentId, new Map());
-      const child = childComponentId ? this.components.get(childComponentId) : null;
-      this.slotMap.get(parentComponentId).set(slotName, child);
+      // Store the ID, not the object — the COMPONENT_UPDATE for the child may
+      // not have arrived yet. getSlots() resolves the object on every render.
+      this.slotMap.get(parentComponentId).set(slotName, childComponentId ?? null);
       this.notify({ type: 'components_changed' });
       return;
     }
@@ -315,12 +316,28 @@ class ComponentDisplaySystem {
   getComponents()     { return Array.from(this.components.values()); }
   getRecentActions()  { return this.actions; }
 
-  // Returns a plain object { slotName: component | null } for a parent component.
-  // The renderer calls this to pass resolved slots as props — it never queries them itself.
+  // Returns { slotName: component | null } for a parent, resolving IDs → objects now.
+  // Called on every render so the child component is always current even if
+  // SLOT_ASSIGNMENT arrived before COMPONENT_UPDATE for that child.
   getSlots(parentId) {
     const slots = this.slotMap.get(parentId);
     if (!slots) return {};
-    return Object.fromEntries(slots);
+    const resolved = {};
+    for (const [slotName, childId] of slots) {
+      resolved[slotName] = childId ? (this.components.get(childId) ?? null) : null;
+    }
+    return resolved;
+  }
+
+  // Returns true if this component is assigned to any slot (so it is suppressed
+  // from the top-level list and rendered inside its parent instead).
+  isSlotted(componentId) {
+    for (const slotsByName of this.slotMap.values()) {
+      for (const childId of slotsByName.values()) {
+        if (childId === componentId) return true;
+      }
+    }
+    return false;
   }
 }
 
@@ -438,7 +455,9 @@ const SlotRenderer = ({ component, onAction }) => {
 // Renderers declare which slots they render; they never decide what fills them.
 
 const UIRenderers = {
-  CARD: ({ data, componentId, onAction, slots = {} }) => (
+  // slotNames: string[] declared by the component (component.slots, not data.slots)
+  // slots: { [slotName]: component | null } resolved by the daemon and passed by App
+  CARD: ({ data, componentId, onAction, slots = {}, slotNames = [] }) => (
     <div
       className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4 cursor-pointer hover:shadow-lg transition-shadow"
       onClick={() => onAction(componentId, 'CLICK', { timestamp: new Date().toISOString() })}
@@ -458,7 +477,7 @@ const UIRenderers = {
           ))}
         </div>
       )}
-      {data.slots?.includes('detail') && (
+      {slotNames.includes('detail') && (
         <div className="mt-4 border-t border-gray-100 pt-4">
           <p className="text-[10px] font-semibold tracking-wide text-gray-400 uppercase mb-2">Detail slot</p>
           <SlotRenderer component={slots.detail ?? null} onAction={onAction} />
@@ -579,15 +598,18 @@ export default function App() {
         {components.map(component => {
           const Renderer = UIRenderers[component.type];
           if (!Renderer) return null;
+          if (displaySystem.isSlotted(component.id)) return null;
           const slots = displaySystem.getSlots(component.id);
-          // Hide components that are assigned to a parent slot — they render inside their parent
-          const isSlotted = Array.from(displaySystem.slotMap.values()).some(
-            m => Array.from(m.values()).some(c => c?.id === component.id)
-          );
-          if (isSlotted) return null;
+          const slotNames = component.slots || [];
           return (
             <div key={component.id}>
-              <Renderer data={component.data} componentId={component.id} onAction={onAction} slots={slots} />
+              <Renderer
+                data={component.data}
+                componentId={component.id}
+                onAction={onAction}
+                slots={slots}
+                slotNames={slotNames}
+              />
             </div>
           );
         })}
