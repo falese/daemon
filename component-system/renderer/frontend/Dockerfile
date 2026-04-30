@@ -14,6 +14,8 @@ COPY . .
 
 # Set environment variable for development
 ENV NODE_ENV=development
+# Bind to all interfaces so the container port is reachable from the host
+ENV HOST=0.0.0.0
 
 # Expose the port the app runs on
 EXPOSE 3000
