@@ -51,6 +51,9 @@
     .rule-badge { background:#2563eb; color:#fff; font-size:.55rem; padding:.15rem .4rem; border-radius:4px; font-weight:600; letter-spacing:.5px; }
     .rule-facts { margin:.4rem 0 0; font-size:.6rem; line-height:1.25; color:#334155; display:flex; flex-wrap:wrap; gap:.35rem; }
     .rule-fact { background:#fff; border:1px solid #c4ddff; padding:.15rem .4rem; border-radius:999px; }
+    .slot-region { margin-top:.85rem; border-top:1px solid #e7ecf5; padding-top:.75rem; }
+    .slot-label { font-size:.6rem; font-weight:600; letter-spacing:.6px; color:#94a3b8; text-transform:uppercase; margin-bottom:.5rem; }
+    .slot-empty { border:1.5px dashed #d1d5db; border-radius:7px; padding:.6rem .8rem; color:#9ca3af; font-size:.75rem; text-align:center; }
   </style>
 </head>
 <body>
@@ -102,6 +105,7 @@
 
     // Local state
     const componentStore = new Map(); // id -> component
+    const slotMap = new Map();        // parentId -> Map<slotName, childId | null>
 
     let ws; let reconnectTimer; let reconnectAttempts = 0;
 
@@ -193,10 +197,18 @@
     function handleDaemonEnvelope(env){
       logDebug(env);
       if(env && env.direction === 'COMPONENT'){
-        if(env.kind === 'STATE_SNAPSHOT'){
+        if(env.kind === 'SLOT_ASSIGNMENT'){
+          const { parentComponentId, slotName, childComponentId } = env.payload || {};
+          if(parentComponentId && slotName){
+            if(!slotMap.has(parentComponentId)) slotMap.set(parentComponentId, new Map());
+            // Store the ID — child COMPONENT_UPDATE may arrive after this message
+            slotMap.get(parentComponentId).set(slotName, childComponentId || null);
+          }
+        } else if(env.kind === 'STATE_SNAPSHOT'){
           applySnapshot(env.payload);
-        } else if(env.kind === 'COMPONENT_UPDATE'){ upsertComponent(env.payload); }
-        else {
+        } else if(env.kind === 'COMPONENT_UPDATE'){
+          upsertComponent(env.payload);
+        } else {
           if(env.payload && env.payload.id && env.payload.type) upsertComponent(env.payload);
         }
       } else if(env && env.direction === 'ACTION' && env.kind === 'ACTION_ECHO'){
@@ -231,10 +243,28 @@
     // =============================
     // Rendering
     // =============================
+    function isSlotted(compId){
+      for(const byName of slotMap.values())
+        for(const childId of byName.values())
+          if(childId === compId) return true;
+      return false;
+    }
+
+    // Resolve slot assignments for a parent: { slotName -> component | null }
+    function resolvedSlots(parentId){
+      const result = {};
+      const byName = slotMap.get(parentId);
+      if(!byName) return result;
+      for(const [slotName, childId] of byName)
+        result[slotName] = childId ? (componentStore.get(childId) || null) : null;
+      return result;
+    }
+
     function render(){
       componentsDiv.innerHTML = '';
-      if(componentStore.size === 0){ emptyDiv.style.display=''; return; } else { emptyDiv.style.display='none'; }
-      for(const comp of componentStore.values()){
+      const visible = Array.from(componentStore.values()).filter(c => !isSlotted(c.id));
+      if(visible.length === 0){ emptyDiv.style.display=''; return; } else { emptyDiv.style.display='none'; }
+      for(const comp of visible){
         componentsDiv.appendChild(renderComponent(comp));
       }
     }
@@ -253,10 +283,28 @@
           });
           break;
         case 'NOTIFICATION': wrap.innerHTML = tplNotification(comp); break;
-        case 'FORM': wrap.innerHTML = tplForm(comp); break;
+        case 'FORM':
+          wrap.innerHTML = tplForm(comp);
+          wrap.querySelector('form').addEventListener('submit', (ev) => {
+            ev.preventDefault();
+            const data = {};
+            new FormData(ev.target).forEach((v,k) => data[k] = v);
+            sendAction(comp.id, 'SUBMIT', data);
+            ev.target.reset();
+          });
+          break;
         default: wrap.innerHTML = tplDefault(comp); break;
       }
       return wrap;
+    }
+
+    function tplSlot(childComp){
+      if(!childComp) return `<div class="slot-empty">Empty slot</div>`;
+      switch(childComp.type){
+        case 'NOTIFICATION': return tplNotification(childComp);
+        case 'CARD':         return tplCard(childComp);
+        default:             return tplDefault(childComp);
+      }
     }
 
     function tplCard(comp){
@@ -267,17 +315,23 @@
       const contentHtml = typeof d.content === 'object'
         ? `<pre>${escapeHtml(JSON.stringify(d.content,null,2))}</pre>`
         : escapeHtml(d.content || '');
+      const slots = comp.slots || [];
+      const detailSlot = slots.includes('detail')
+        ? `<div class="slot-region"><div class="slot-label">Detail slot</div>${tplSlot(resolvedSlots(comp.id).detail || null)}</div>`
+        : '';
       return `<div class="card-title">${escapeHtml(d.title||'Card')}</div>
               <div class="card-subtitle">${escapeHtml(d.subtitle||'')}</div>
               <div class="card-content">${contentHtml}</div>
               <div class="card-actions">${buttons}</div>
+              ${detailSlot}
               ${ruleEval(comp)}
               ${meta(comp)}`;
     }
 
     function tplNotification(comp){
-      const d = comp.data || {}; const t = (d.type||'info').toLowerCase();
-      return `<div class="notification ${t}">
+      const d = comp.data || {};
+      const statusClass = escapeHtml((d.status||d.type||'info').toLowerCase());
+      return `<div class="notification ${statusClass}">
         <div class="notification-title">${escapeHtml(d.title||'Notification')}</div>
         <div class="card-content">${escapeHtml(d.message||'')}</div>
         ${ruleEval(comp)}
@@ -289,7 +343,7 @@
       const d = comp.data || {}; const fields = (d.fields||[]).map(f=>fieldHtml(f)).join('');
       return `<div class="form">
         <div class="form-title">${escapeHtml(d.title||'Form')}</div>
-        <form onsubmit="handleFormSubmit(event,'${comp.id}')">${fields}<div style="margin-top:.5rem;"><button type="submit" class="btn">${escapeHtml(d.submitText||'Submit')}</button></div></form>
+        <form data-comp-id="${escapeHtml(comp.id)}">${fields}<div style="margin-top:.5rem;"><button type="submit" class="btn">${escapeHtml(d.submitText||'Submit')}</button></div></form>
         ${ruleEval(comp)}
         ${meta(comp)}
       </div>`;
@@ -332,15 +386,6 @@
         timestamp: new Date().toISOString()
       };
       postAction(action);
-    }
-
-    function handleFormSubmit(evt, componentId){
-      evt.preventDefault();
-      const form = evt.target;
-      const data = {};
-      new FormData(form).forEach((v,k)=> data[k]=v);
-      sendAction(componentId,'SUBMIT', data);
-      form.reset();
     }
 
     function postAction(action){

@@ -79,6 +79,7 @@ const logger = {
 class ComponentDaemon {
   constructor() {
     this.componentState = new Map(); // id -> { component, actions: [], lastUpdated }
+    this.slotAssignments = new Map(); // parentId -> Map<slotName, childId | null>
     this.pubsub = new PubSub();
     this.registrySocket = null;
     this.registryReconnectAttempt = 0;
@@ -122,7 +123,7 @@ class ComponentDaemon {
           ws.send(JSON.stringify({
             id: 'registry-sub',
             type: 'subscribe',
-            payload: { query: 'subscription { componentUpdate { id type data createdAt } }' }
+            payload: { query: 'subscription { componentUpdate { id type data createdAt slots } }' }
           }));
           break;
 
@@ -270,6 +271,64 @@ class ComponentDaemon {
         lastUpdated: new Date().toISOString()
       });
     }
+    this.resolveSlotAssignment(component);
+  }
+
+  // ── Slot composition ───────────────────────────────────────────────────────
+  // The daemon owns the slot map. Components declare slot names; Registry rules
+  // express intent via data._slot; the daemon enforces and broadcasts assignments.
+
+  resolveSlotAssignment(component) {
+    const directive = component.data?._slot;
+    if (!directive?.parentId || !directive?.slotName) return;
+
+    const parent = this.componentState.get(directive.parentId)?.component;
+    if (!parent?.slots?.includes(directive.slotName)) return;
+
+    if (!this.slotAssignments.has(directive.parentId))
+      this.slotAssignments.set(directive.parentId, new Map());
+    this.slotAssignments.get(directive.parentId).set(directive.slotName, component.id);
+
+    logger.info(
+      { code: 'DAE-250', event: 'SLOT_ASSIGNED', parentId: directive.parentId, slotName: directive.slotName, childId: component.id },
+      'Slot assignment resolved'
+    );
+    this.publishSlotAssignment(directive.parentId, directive.slotName, component.id);
+  }
+
+  publishSlotAssignment(parentComponentId, slotName, childComponentId) {
+    const assignment = { parentComponentId, slotName, childComponentId };
+    this.publish(this.buildMessage({
+      direction: MessageDirection.COMPONENT,
+      kind:      'SLOT_ASSIGNMENT',
+      payload:   assignment
+    }));
+  }
+
+  assignSlot(parentId, slotName, childId) {
+    const parent = this.componentState.get(parentId)?.component;
+    if (!parent?.slots?.includes(slotName)) return false;
+
+    if (!this.slotAssignments.has(parentId))
+      this.slotAssignments.set(parentId, new Map());
+    this.slotAssignments.get(parentId).set(slotName, childId ?? null);
+
+    logger.info(
+      { code: 'DAE-251', event: 'SLOT_ASSIGNED_EXPLICIT', parentId, slotName, childId },
+      'Explicit slot assignment'
+    );
+    this.publishSlotAssignment(parentId, slotName, childId ?? null);
+    return true;
+  }
+
+  getSlotAssignments() {
+    const result = [];
+    for (const [parentId, slots] of this.slotAssignments) {
+      for (const [slotName, childId] of slots) {
+        result.push({ parentComponentId: parentId, slotName, childComponentId: childId });
+      }
+    }
+    return result;
   }
 
   // ── Forward action to Registry ─────────────────────────────────────────────
@@ -377,7 +436,7 @@ const typeDefs = `
   enum MessageDirection { COMPONENT ACTION }
 
   # Kind refines the message type within each direction
-  enum MessageKind { COMPONENT_UPDATE STATE_SNAPSHOT ACTION_ECHO }
+  enum MessageKind { COMPONENT_UPDATE STATE_SNAPSHOT ACTION_ECHO SLOT_ASSIGNMENT }
 
   type MessageMetadata {
     acknowledged: Boolean!
@@ -397,6 +456,13 @@ const typeDefs = `
     type:      String!
     data:      JSON!
     createdAt: String!
+    slots:     [String!]
+  }
+
+  type SlotAssignment {
+    parentComponentId: String!
+    slotName:          String!
+    childComponentId:  String
   }
 
   type Action {
@@ -416,12 +482,16 @@ const typeDefs = `
   type Query {
     components:      [Component!]!
     componentStates: [ComponentState!]!
+    slotAssignments: [SlotAssignment!]!
   }
 
   type Mutation {
     # Accepts a JSON-serialised message envelope (direction + payload).
     # Used by renderers to send user actions up to the daemon.
     sendMessage(message: String!): Boolean!
+    # Explicitly assign a child component to a named slot on a parent component.
+    # childId may be omitted or null to clear the slot.
+    assignSlot(parentId: String!, slotName: String!, childId: String): Boolean!
   }
 
   type Subscription {
@@ -441,7 +511,8 @@ function createResolvers(daemon) {
 
     Query: {
       components:      () => daemon.getComponents(),
-      componentStates: () => daemon.getComponentStates()
+      componentStates: () => daemon.getComponentStates(),
+      slotAssignments: () => daemon.getSlotAssignments()
     },
 
     Mutation: {
@@ -451,7 +522,9 @@ function createResolvers(daemon) {
         catch { throw new Error('sendMessage: message must be a valid JSON string'); }
         await daemon.handleMessage(parsed);
         return true;
-      }
+      },
+      assignSlot: (_, { parentId, slotName, childId }) =>
+        daemon.assignSlot(parentId, slotName, childId ?? null)
     },
 
     Subscription: {

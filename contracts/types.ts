@@ -32,6 +32,18 @@ export interface Component {
   type: 'CARD' | 'FORM' | 'NOTIFICATION' | string;
   data: Record<string, unknown>;
   createdAt: string; // ISO-8601
+  /** Named holes this component exposes. The daemon decides what fills each slot. */
+  slots?: string[];
+}
+
+/**
+ * The daemon's authoritative record of what occupies a named slot on a parent component.
+ * childComponentId is null when the slot has been explicitly cleared.
+ */
+export interface SlotAssignment {
+  parentComponentId: string;
+  slotName: string;
+  childComponentId: string | null;
 }
 
 /**
@@ -89,7 +101,8 @@ export type MessageKind =
   | 'COMPONENT_UPDATE'
   | 'STATE_SNAPSHOT'
   | 'ACTION_ECHO'
-  | 'ACTION';
+  | 'ACTION'
+  | 'SLOT_ASSIGNMENT';
 
 export interface MessageMetadata {
   /**
@@ -117,7 +130,7 @@ export interface MessageMetadata {
 export interface Message {
   direction: MessageDirection;
   kind: MessageKind;
-  payload: Component | ActionRecord | ComponentState;
+  payload: Component | ActionRecord | ComponentState | SlotAssignment;
   metadata: MessageMetadata;
 }
 

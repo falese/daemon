@@ -18,8 +18,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 //   sendMessage(envelope)          — send an action to the daemon
 
 class GraphQLWebSocketClient {
-  constructor(url = `ws://${window.location.hostname}:3001/graphql`) {
-    this.url = url;
+  constructor() {
+    // Port resolution order:
+    //   1. ?daemonPort=N  query param  (hot-switch without rebuild)
+    //   2. REACT_APP_DAEMON_PORT env var  (set in docker-compose or .env)
+    //   3. 3001  (rust-daemon default)
+    const qp = new URLSearchParams(window.location.search).get('daemonPort');
+    const port = qp || process.env.REACT_APP_DAEMON_PORT || '3001';
+    this.url = `ws://${window.location.hostname}:${port}/graphql`;
     this.ws = null;
     this.connected = false;
     this.reconnectAttempts = 0;
@@ -178,14 +184,19 @@ class ComponentDisplaySystem {
     this.graphqlClient = new GraphQLWebSocketClient();
     this.components = new Map();    // id -> component
     this.componentStates = new Map(); // id -> { component, actions, lastUpdated }
+    this.slotMap = new Map();       // parentId -> Map<slotName, childId | null>
     this.actions = [];              // recent action echoes (capped at 50)
     this.subscribers = new Set();   // React state update callbacks
+    // Stable references so repeated connect() calls (React StrictMode) don't
+    // register duplicate handlers on the singleton graphqlClient.
+    this._onComponent = msg => this.handleComponentEnvelope(msg);
+    this._onAction    = msg => this.handleActionEnvelope(msg);
   }
 
   async connect() {
-    // Register message handlers before opening the socket so no messages are missed
-    this.graphqlClient.onMessage('COMPONENT', msg => this.handleComponentEnvelope(msg));
-    this.graphqlClient.onMessage('ACTION',    msg => this.handleActionEnvelope(msg));
+    // onMessage uses a Set — stable references make this idempotent
+    this.graphqlClient.onMessage('COMPONENT', this._onComponent);
+    this.graphqlClient.onMessage('ACTION',    this._onAction);
 
     try {
       await this.graphqlClient.connect();
@@ -206,6 +217,19 @@ class ComponentDisplaySystem {
   // component into the local store". Extract the component then upsert.
 
   handleComponentEnvelope(message) {
+    // SLOT_ASSIGNMENT: daemon tells us which component fills a named slot.
+    // Update slotMap only — do not add the child to the top-level component list.
+    if (message.kind === 'SLOT_ASSIGNMENT') {
+      const { parentComponentId, slotName, childComponentId } = message.payload;
+      if (!this.slotMap.has(parentComponentId))
+        this.slotMap.set(parentComponentId, new Map());
+      // Store the ID, not the object — the COMPONENT_UPDATE for the child may
+      // not have arrived yet. getSlots() resolves the object on every render.
+      this.slotMap.get(parentComponentId).set(slotName, childComponentId ?? null);
+      this.notify({ type: 'components_changed' });
+      return;
+    }
+
     let component;
 
     if (message.kind === 'STATE_SNAPSHOT' && message.payload?.component) {
@@ -295,6 +319,30 @@ class ComponentDisplaySystem {
 
   getComponents()     { return Array.from(this.components.values()); }
   getRecentActions()  { return this.actions; }
+
+  // Returns { slotName: component | null } for a parent, resolving IDs → objects now.
+  // Called on every render so the child component is always current even if
+  // SLOT_ASSIGNMENT arrived before COMPONENT_UPDATE for that child.
+  getSlots(parentId) {
+    const slots = this.slotMap.get(parentId);
+    if (!slots) return {};
+    const resolved = {};
+    for (const [slotName, childId] of slots) {
+      resolved[slotName] = childId ? (this.components.get(childId) ?? null) : null;
+    }
+    return resolved;
+  }
+
+  // Returns true if this component is assigned to any slot (so it is suppressed
+  // from the top-level list and rendered inside its parent instead).
+  isSlotted(componentId) {
+    for (const slotsByName of this.slotMap.values()) {
+      for (const childId of slotsByName.values()) {
+        if (childId === componentId) return true;
+      }
+    }
+    return false;
+  }
 }
 
 // Singleton — one connection shared across the whole app
@@ -334,6 +382,8 @@ const useComponentDisplay = () => {
             components: displaySystem.getComponents(),
             actions:    displaySystem.getRecentActions()
           }));
+          break;
+        default:
           break;
       }
     });
@@ -382,13 +432,36 @@ const RuleEvaluation = ({ evalData }) => {
 };
 
 // ========================
+// SLOT RENDERER
+// ========================
+// Renders whatever component the daemon has assigned to a slot.
+// Receives the resolved component object (or null) — never queries for it.
+
+const SlotRenderer = ({ component, onAction }) => {
+  if (!component) {
+    return (
+      <div className="border border-dashed border-gray-300 rounded p-3 text-center text-gray-400 text-xs">
+        Empty slot
+      </div>
+    );
+  }
+  // eslint-disable-next-line no-use-before-define
+  const Renderer = UIRenderers[component.type];
+  if (!Renderer) return null;
+  return <Renderer data={component.data} componentId={component.id} onAction={onAction} slots={{}} />;
+};
+
+// ========================
 // UI COMPONENT RENDERERS
 // ========================
-// One renderer per component type. Each receives `data`, `componentId`, and
-// `onAction`. Call `onAction(componentId, actionType, data)` to send an action.
+// One renderer per component type. Each receives `data`, `componentId`, `onAction`,
+// and `slots` (a { [slotName]: component | null } object resolved by the daemon).
+// Renderers declare which slots they render; they never decide what fills them.
 
 const UIRenderers = {
-  CARD: ({ data, componentId, onAction }) => (
+  // slotNames: string[] declared by the component (component.slots, not data.slots)
+  // slots: { [slotName]: component | null } resolved by the daemon and passed by App
+  CARD: ({ data, componentId, onAction, slots = {}, slotNames = [] }) => (
     <div
       className="max-w-sm mx-auto bg-white rounded-lg shadow-md p-6 mb-4 cursor-pointer hover:shadow-lg transition-shadow"
       onClick={() => onAction(componentId, 'CLICK', { timestamp: new Date().toISOString() })}
@@ -406,6 +479,12 @@ const UIRenderers = {
               {button.text}
             </button>
           ))}
+        </div>
+      )}
+      {slotNames.includes('detail') && (
+        <div className="mt-4 border-t border-gray-100 pt-4">
+          <p className="text-[10px] font-semibold tracking-wide text-gray-400 uppercase mb-2">Detail slot</p>
+          <SlotRenderer component={slots.detail ?? null} onAction={onAction} />
         </div>
       )}
       <RuleEvaluation evalData={data._ruleEvaluation} />
@@ -523,9 +602,18 @@ export default function App() {
         {components.map(component => {
           const Renderer = UIRenderers[component.type];
           if (!Renderer) return null;
+          if (displaySystem.isSlotted(component.id)) return null;
+          const slots = displaySystem.getSlots(component.id);
+          const slotNames = component.slots || [];
           return (
             <div key={component.id}>
-              <Renderer data={component.data} componentId={component.id} onAction={onAction} />
+              <Renderer
+                data={component.data}
+                componentId={component.id}
+                onAction={onAction}
+                slots={slots}
+                slotNames={slotNames}
+              />
             </div>
           );
         })}

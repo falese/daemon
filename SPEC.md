@@ -11,11 +11,13 @@ Build a **control plane daemon** that sits between a UI renderer and a backend r
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                        RENDERER                              │
-│  (React or HTML)  port 3000 / 8081                          │
+│  (React CSR / HTML / React SSR)  port 3000 / 8081 / 3003   │
 │                                                              │
 │  • Subscribes to Daemon via GraphQL WS subscription          │
 │  • Sends user actions (CLICK, SUBMIT) via GraphQL mutation   │
 │  • Renders components returned by the daemon                 │
+│  • SSR variant: fetches initial state via HTTP on each       │
+│    request, streams HTML, then hydrates for live updates     │
 └──────────────────────────┬───────────────────────────────────┘
                            │  GraphQL over WebSocket
                            │  (graphql-transport-ws protocol)
@@ -57,9 +59,16 @@ interface SharedState {
 
 interface Component {
   id: string;
-  type: "CARD" | "NOTIFICATION" | "FORM" | "ACTION_ECHO" | "STATE_SNAPSHOT";
+  type: "CARD" | "NOTIFICATION" | "FORM" | "ACTION_ECHO" | "STATE_SNAPSHOT" | string;
   data: Record<string, unknown>;        // component-specific payload
   createdAt: string;                    // ISO timestamp
+  slots?: string[];                     // named holes this component exposes (e.g. ["detail"])
+}
+
+interface SlotAssignment {
+  parentComponentId: string;
+  slotName: string;
+  childComponentId: string | null;      // null = slot is cleared
 }
 
 interface ActionRecord {
@@ -71,6 +80,8 @@ interface ActionRecord {
 }
 ```
 
+The daemon also maintains `slotAssignments: Map<parentId, Map<slotName, childId | null>>` — the authoritative map of what fills each declared slot. Only the daemon writes this map; renderers read it via `SLOT_ASSIGNMENT` messages.
+
 ---
 
 ## Message Protocol
@@ -81,7 +92,7 @@ All messages flowing over WebSocket subscriptions share this envelope:
 interface Message {
   direction: "COMPONENT" | "ACTION";
   kind: MessageKind;
-  payload: Component | ActionRecord;
+  payload: Component | ActionRecord | SlotAssignment;
   metadata: {
     correlationId: string;    // UUID, set at origin, carried end-to-end
     acknowledged: boolean;
@@ -94,7 +105,10 @@ type MessageKind =
   | "STATE_SNAPSHOT"      // full state dump (sent on connect and on request)
   | "ACTION_ECHO"         // daemon acknowledges receipt of renderer action
   | "ACTION_FORWARD"      // daemon forwarding action to registry
+  | "SLOT_ASSIGNMENT"     // daemon notifies renderers that a slot's occupant changed
 ```
+
+`SLOT_ASSIGNMENT` always precedes the `COMPONENT_UPDATE` for the same child component in the same flush. Renderers store the child ID (not the object) and resolve it lazily on each render to handle this ordering safely.
 
 ---
 
@@ -137,28 +151,47 @@ enum ComponentType {
 
 ```graphql
 type Query {
-  state: StateSnapshot!
+  state:           StateSnapshot!
+  components:      [Component!]!
+  slotAssignments: [SlotAssignment!]!
 }
 
 type Mutation {
-  sendAction(action: ActionInput!): ActionResult!
+  sendMessage(message: String!): Boolean!
+  # Directly assign a component to a named slot (bypasses registry rules).
+  # Pass childId: null to clear the slot.
+  assignSlot(parentId: String!, slotName: String!, childId: String): Boolean!
 }
 
 type Subscription {
   messages: Message!
 }
 
+type Component {
+  id:        ID!
+  type:      String!
+  data:      JSON
+  createdAt: String!
+  slots:     [String!]   # named holes this component exposes
+}
+
+type SlotAssignment {
+  parentComponentId: String!
+  slotName:          String!
+  childComponentId:  String   # null = slot is empty
+}
+
 type StateSnapshot {
   components: [Component!]!
-  actions: [ActionRecord!]!
+  actions:    [ActionRecord!]!
   lastUpdated: String!
 }
 
 type Message {
   direction: Direction!
-  kind: MessageKind!
-  payload: JSON!
-  metadata: MessageMetadata!
+  kind:      MessageKind!
+  payload:   JSON!
+  metadata:  MessageMetadata!
 }
 ```
 
@@ -181,8 +214,10 @@ interface Rule {
 
 | Rule | Trigger | Output |
 |------|---------|--------|
-| `card-click` | CARD component + CLICK action | NOTIFICATION component |
-| `form-submit` | FORM component + SUBMIT action | CARD component with submitted data |
+| `card-click` | CARD component + CLICK action | NOTIFICATION with `data._slot = { parentId, slotName: 'detail' }` — slotted inside the CARD |
+| `form-submit` | FORM component + SUBMIT action | CARD with `slots: ['detail']` and submitted data |
+
+The `_slot` field in `data` is a routing *intent* read and consumed by the daemon. It is not stripped before forwarding — renderers receive it in `data` but ignore it (they read only the `slots` prop passed from the display system).
 
 ---
 
@@ -225,6 +260,48 @@ interface Rule {
 
 ---
 
+## Slot Composition
+
+The daemon enforces a strict separation of concerns around slot assignment:
+
+| Layer | Responsibility |
+|---|---|
+| **Component** (`slots: string[]`) | Declaring that a named slot exists |
+| **Registry rule** (`data._slot`) | Expressing routing *intent* (which slot a generated component should fill) |
+| **Daemon** (`slotAssignments` map) | Single source of truth; validates and broadcasts assignments |
+| **Renderer** (`slotMap`) | Displaying whatever the daemon assigned; never selecting slot contents |
+
+### Slot assignment data flow
+
+1. Registry rule generates a component with `data._slot = { parentId, slotName }`.
+2. Daemon's `storeComponent` calls `resolveSlotAssignment`:
+   - Validates `parent.slots.includes(slotName)`.
+   - Updates `slotAssignments` map.
+   - Publishes `SLOT_ASSIGNMENT` then `COMPONENT_UPDATE` (in that order).
+3. Renderer receives `SLOT_ASSIGNMENT` → stores child *ID* in `slotMap`.
+4. Renderer receives `COMPONENT_UPDATE` → stores child *object* in `components`.
+5. On next render, `getSlots(parentId)` resolves ID → object from the component map.
+
+Storing the ID rather than the object in step 3 handles the guaranteed ordering (slot assignment before component update) without any race condition.
+
+---
+
+## Renderer Variants
+
+Three renderer implementations share the same daemon protocol:
+
+| | React CSR | HTML | React SSR |
+|---|---|---|---|
+| **Port** | 3000 | 8081 | 3003 |
+| **Initial paint** | Empty shell, components load after WS connects | Same | Full HTML with live component data |
+| **Live updates** | WebSocket subscription | WebSocket subscription | WebSocket subscription (after hydration) |
+| **Build** | Create React App | None | Vite (client + SSR bundle) |
+| **Slots** | Yes | Yes | Yes |
+
+The SSR renderer fetches `components` and `slotAssignments` from the daemon via HTTP before rendering, serialises the state into `window.__INITIAL_STATE__`, and hydrates with `hydrateRoot` on the client. The first paint always reflects the live state at request time.
+
+---
+
 ## Implementation Variants
 
 Two daemon implementations exist for evaluation:
@@ -236,9 +313,10 @@ Two daemon implementations exist for evaluation:
 | **GraphQL** | graphql-ws + apollo | async-graphql + warp |
 | **State** | JS Map | DashMap (concurrent) |
 | **Broadcast** | EventEmitter | tokio::broadcast |
+| **Slot composition** | Yes (`assignSlot` mutation) | No (not yet implemented) |
 | **Status** | Reference implementation | Performance variant |
 
-The Node.js daemon is the **reference implementation**. The Rust daemon is a performance-oriented variant. They implement the same protocol and are interchangeable.
+The Node.js daemon is the **reference implementation**. The Rust daemon is a performance-oriented variant. They implement the same protocol and are interchangeable for features that both support.
 
 ---
 

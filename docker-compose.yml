@@ -37,6 +37,10 @@ services:
       dockerfile: Dockerfile
     ports:
       - 3000:3000
+    environment:
+      # node-daemon is on host port 3002; rust-daemon on 3001.
+      # Override with REACT_APP_DAEMON_PORT=3001 to target rust-daemon.
+      - REACT_APP_DAEMON_PORT=3002
     depends_on:
       - registry
     networks:
@@ -50,6 +54,22 @@ services:
       - 8081:8080
     depends_on:
       - registry
+    networks:
+      - component-network
+
+  ssr-renderer:
+    build:
+      context: ./component-system/renderer/ssr
+      dockerfile: Dockerfile
+    ports:
+      - 3003:3003
+    environment:
+      # Server-side HTTP fetch — uses internal Docker network name
+      - DAEMON_HTTP_URL=http://node-daemon:3001/graphql
+      # Port the browser uses to reach the daemon WebSocket (host port mapping)
+      - PUBLIC_DAEMON_PORT=3002
+    depends_on:
+      - node-daemon
     networks:
       - component-network
 

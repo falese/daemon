@@ -14,7 +14,15 @@ make all          # start the registry
 make stack        # interactively choose a daemon + renderer
 ```
 
-Then open http://localhost:3000 (React renderer) or http://localhost:8081 (HTML renderer).
+Then open one of the renderers:
+
+| Renderer | URL | Notes |
+|---|---|---|
+| React (CSR) | http://localhost:3000 | Create React App, live WebSocket |
+| HTML | http://localhost:8081 | Vanilla JS, no build step |
+| React (SSR) | http://localhost:3003 | Server-rendered HTML + hydration |
+
+The SSR renderer (`make ssr-renderer`) requires the Node daemon (`make node-daemon`) to be running since it fetches the initial state snapshot over HTTP before streaming the first byte.
 
 ---
 
@@ -34,21 +42,28 @@ A form appears in the renderer. Submit it (click "Send Message") and watch:
 
 This is the core teaching pattern: **renderer sends an action, the rules engine decides what to render next**.
 
+Click the resulting CARD to see slot composition in action:
+- The `card-click` rule fires and generates a NOTIFICATION with a `_slot` directive pointing at the CARD's `detail` slot.
+- The daemon validates the assignment and broadcasts a `SLOT_ASSIGNMENT` message.
+- All renderers move the NOTIFICATION *inside* the CARD rather than appending it below.
+
+See [SLOT-COMPOSITION.md](./SLOT-COMPOSITION.md) for the full design.
+
 ---
 
 ## Architecture
 
 ```
-┌─────────────┐  subscription   ┌─────────────┐  subscription   ┌─────────────┐
-│  Registry   │ ──────────────► │    Daemon   │ ──────────────► │  Renderer   │
-│  :4000      │                 │    :3001    │                 │  :3000/8081 │
-│             │ ◄────────────── │             │ ◄────────────── │             │
-│  Rules +    │  handleMessage  │  Middleware │  sendMessage    │  UI         │
-│  State      │  mutation       │  + State    │  mutation       │             │
-└─────────────┘                 └─────────────┘                 └─────────────┘
+┌─────────────┐  subscription   ┌─────────────┐  subscription   ┌──────────────────────┐
+│  Registry   │ ──────────────► │    Daemon   │ ──────────────► │  Renderer            │
+│  :4000      │                 │    :3001    │                 │  :3000 / :8081 /     │
+│             │ ◄────────────── │             │ ◄────────────── │  :3003               │
+│  Rules +    │  handleMessage  │  Middleware │  sendMessage    │  React / HTML / SSR  │
+│  State      │  mutation       │  + State    │  mutation       │                      │
+└─────────────┘                 └─────────────┘                 └──────────────────────┘
 ```
 
-All connections use the `graphql-transport-ws` subprotocol over WebSocket.
+All connections use the `graphql-transport-ws` subprotocol over WebSocket. The SSR renderer additionally makes a one-shot HTTP GraphQL request to fetch the initial snapshot before streaming HTML.
 
 ### Service Roles
 
@@ -56,9 +71,10 @@ All connections use the `graphql-transport-ws` subprotocol over WebSocket.
 |---|---|
 | **Registry** (`registry/simple-registry.js`) | Stores component state, runs the rules engine, publishes `componentUpdate` subscriptions, exposes REST `POST /render` |
 | **Rust Daemon** (`daemon/rust/component-daemon/src/main.rs`) | High-performance middleware; subscribes to registry, broadcasts to renderers, forwards actions back to registry |
-| **Node Daemon** (`daemon/simple-daemon.js`) | Same role as Rust daemon — an alternative implementation to show the pattern isn't language-specific |
-| **React Renderer** (`renderer/frontend`) | Subscribes to daemon, renders CARD / FORM / NOTIFICATION components, sends user actions back via GraphQL mutation |
+| **Node Daemon** (`daemon/simple-daemon.js`) | Same role as Rust daemon; also owns the slot assignment map and `assignSlot` mutation |
+| **React Renderer** (`renderer/frontend`) | CSR; subscribes to daemon, renders CARD / FORM / NOTIFICATION components, sends user actions back via GraphQL mutation |
 | **HTML Renderer** (`renderer/html`) | Lightweight alternative renderer; plain HTML + JS, no build step |
+| **SSR Renderer** (`renderer/ssr`) | Renders initial HTML on the server using `renderToPipeableStream`, streams it to the browser, then hydrates and subscribes via WebSocket for live updates |
 
 ---
 
@@ -132,8 +148,8 @@ Default rules:
 
 | Rule | Condition | Generates |
 |---|---|---|
-| `card-click` | CARD component + CLICK action | NOTIFICATION |
-| `form-submit` | FORM component + SUBMIT action | CARD with submitted data |
+| `card-click` | CARD component + CLICK action | NOTIFICATION slotted into the CARD's `detail` slot |
+| `form-submit` | FORM component + SUBMIT action | CARD with `slots: ['detail']` and submitted data |
 
 Run the unit tests to see them in isolation:
 
@@ -244,6 +260,57 @@ curl -X POST http://localhost:4000/render \
 
 ---
 
+## Slot Composition
+
+Components can declare named holes in their layout (`slots: ['detail']`). The daemon owns the authoritative mapping of what fills each slot and broadcasts `SLOT_ASSIGNMENT` messages when an assignment changes. Renderers display whatever the daemon assigned — they never decide the contents themselves.
+
+The built-in demo shows this end-to-end:
+1. `make form` → injects a FORM
+2. Submit the form → `form-submit` rule creates a CARD with `slots: ['detail']`
+3. Click the CARD → `card-click` rule creates a NOTIFICATION with `data._slot = { parentId, slotName: 'detail' }`
+4. Daemon validates and maps the slot → broadcasts `SLOT_ASSIGNMENT`
+5. NOTIFICATION appears *inside* the CARD's detail section, not in the global list
+
+You can also assign slots directly via GraphQL:
+
+```graphql
+mutation {
+  assignSlot(parentId: "card-id", slotName: "detail", childId: "notif-id")
+}
+```
+
+Pass `childId: null` to clear a slot. Full design: [SLOT-COMPOSITION.md](./SLOT-COMPOSITION.md).
+
+---
+
+## SSR Renderer
+
+The SSR renderer at `renderer/ssr` demonstrates streaming server-side rendering alongside the live WebSocket approach:
+
+1. **On each request**, Express fetches the current components and slot assignments from the daemon via HTTP POST `/graphql`.
+2. React renders the component tree on the server using `renderToPipeableStream` and streams HTML to the browser immediately (shell first, then component content).
+3. `window.__INITIAL_STATE__` and `window.__DAEMON_PORT__` are injected into the HTML head.
+4. The client bundle hydrates with `hydrateRoot` using the same initial state — no flash of unstyled or empty content.
+5. After hydration, a WebSocket subscription keeps the UI live (same as the CSR renderer).
+
+```
+Browser                    SSR Server (3003)        Node Daemon (3002)
+  |                              |                        |
+  | GET /                        |                        |
+  |─────────────────────────────►|                        |
+  |                              | POST /graphql          |
+  |                              |───────────────────────►|
+  |                              |◄── components + slots ─|
+  |◄── stream: HTML shell ───────|                        |
+  |◄── stream: components ───────|                        |
+  |◄── stream: closing tags ─────|                        |
+  | hydrateRoot()                |                        |
+  |─────────── WS subscribe ─────────────────────────────►|
+  |◄─────────────────── live COMPONENT_UPDATE / SLOT_ASSIGNMENT ──|
+```
+
+---
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -252,6 +319,8 @@ curl -X POST http://localhost:4000/render \
 | `COMPONENT_TTL_MS` | `600000` (10 min) | How long the registry keeps a component in memory |
 | `LOG_JSON` | unset | Set to `1` for structured JSON logs from the Node daemon |
 | `PORT` | `3001` | Daemon HTTP/WS port |
+| `DAEMON_HTTP_URL` | `http://localhost:3001/graphql` | HTTP endpoint the SSR server uses to fetch initial state |
+| `PUBLIC_DAEMON_PORT` | `3001` | Daemon WebSocket port the browser connects to after hydration |
 
 Both daemons bind to port 3001 inside Docker. The `docker-compose.yml` maps the Rust daemon to host port `3001` and the Node daemon to host port `3002`, so you **can** run both simultaneously — they just serve from different host ports.
 

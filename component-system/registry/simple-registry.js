@@ -44,7 +44,7 @@ class ComponentRegistry {
   //   generate(state, action)  → { type, data }  — what component to create?
 
   setupDefaultRules() {
-    // Rule: clicking a CARD produces a NOTIFICATION
+    // Rule: clicking a CARD produces a NOTIFICATION placed into the card's 'detail' slot
     this.rules.set('card-click', {
       condition: (state, action) =>
         state.component.type === 'CARD' &&
@@ -53,18 +53,23 @@ class ComponentRegistry {
         type: 'NOTIFICATION',
         data: {
           message: `Card "${state.component.data?.title || state.component.id}" was clicked!`,
-          status: 'INFO'
+          status: 'INFO',
+          // Routing intent: the daemon will place this notification into the
+          // card's 'detail' slot. The NOTIFICATION itself does not know this.
+          _slot: { parentId: state.component.id, slotName: 'detail' }
         }
       })
     });
 
-    // Rule: submitting a FORM produces a CARD summarising the submitted data
+    // Rule: submitting a FORM produces a CARD summarising the submitted data.
+    // The CARD declares a 'detail' slot so further interactions can compose into it.
     this.rules.set('form-submit', {
       condition: (state, action) =>
         state.component.type === 'FORM' &&
         action.actionType === 'SUBMIT',
       generate: (_state, action) => ({
         type: 'CARD',
+        slots: ['detail'],
         data: {
           title: 'Form Submission',
           content: JSON.stringify(action.data),
@@ -169,12 +174,13 @@ class ComponentRegistry {
   }
 
   // Create a new component, store it, schedule its eviction, and publish it
-  renderComponent({ type, data }) {
+  renderComponent({ type, data, slots }) {
     const component = {
       id: uuidv4(),
       type,
       data,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      ...(slots?.length ? { slots } : {})
     };
 
     const state = {
@@ -220,7 +226,7 @@ const typeDefs = `
 
   type Mutation {
     # Inject a component directly (type = CARD | NOTIFICATION | FORM)
-    renderComponent(type: ComponentType!, data: JSON!): Component!
+    renderComponent(type: ComponentType!, data: JSON!, slots: [String!]): Component!
 
     # Route a message envelope from the daemon (direction = ACTION | COMPONENT)
     handleMessage(message: String!): Boolean!
@@ -237,6 +243,7 @@ const typeDefs = `
     type: ComponentType!
     data: JSON!
     createdAt: String!
+    slots: [String!]
   }
 
   type Action {
@@ -272,9 +279,9 @@ function createResolvers(registry) {
     },
 
     Mutation: {
-      renderComponent: (_, { type, data }) => {
+      renderComponent: (_, { type, data, slots }) => {
         console.log(`🎨 Registry: renderComponent type=${type}`);
-        return registry.renderComponent({ type, data });
+        return registry.renderComponent({ type, data, slots });
       },
       handleMessage: async (_, { message }) => {
         let parsed;
