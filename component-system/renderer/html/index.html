@@ -283,7 +283,16 @@
           });
           break;
         case 'NOTIFICATION': wrap.innerHTML = tplNotification(comp); break;
-        case 'FORM': wrap.innerHTML = tplForm(comp); break;
+        case 'FORM':
+          wrap.innerHTML = tplForm(comp);
+          wrap.querySelector('form').addEventListener('submit', (ev) => {
+            ev.preventDefault();
+            const data = {};
+            new FormData(ev.target).forEach((v,k) => data[k] = v);
+            sendAction(comp.id, 'SUBMIT', data);
+            ev.target.reset();
+          });
+          break;
         default: wrap.innerHTML = tplDefault(comp); break;
       }
       return wrap;
@@ -320,8 +329,9 @@
     }
 
     function tplNotification(comp){
-      const d = comp.data || {}; const t = (d.type||'info').toLowerCase();
-      return `<div class="notification ${t}">
+      const d = comp.data || {};
+      const statusClass = escapeHtml((d.status||d.type||'info').toLowerCase());
+      return `<div class="notification ${statusClass}">
         <div class="notification-title">${escapeHtml(d.title||'Notification')}</div>
         <div class="card-content">${escapeHtml(d.message||'')}</div>
         ${ruleEval(comp)}
@@ -333,7 +343,7 @@
       const d = comp.data || {}; const fields = (d.fields||[]).map(f=>fieldHtml(f)).join('');
       return `<div class="form">
         <div class="form-title">${escapeHtml(d.title||'Form')}</div>
-        <form onsubmit="handleFormSubmit(event,'${comp.id}')">${fields}<div style="margin-top:.5rem;"><button type="submit" class="btn">${escapeHtml(d.submitText||'Submit')}</button></div></form>
+        <form data-comp-id="${escapeHtml(comp.id)}">${fields}<div style="margin-top:.5rem;"><button type="submit" class="btn">${escapeHtml(d.submitText||'Submit')}</button></div></form>
         ${ruleEval(comp)}
         ${meta(comp)}
       </div>`;
@@ -376,15 +386,6 @@
         timestamp: new Date().toISOString()
       };
       postAction(action);
-    }
-
-    function handleFormSubmit(evt, componentId){
-      evt.preventDefault();
-      const form = evt.target;
-      const data = {};
-      new FormData(form).forEach((v,k)=> data[k]=v);
-      sendAction(componentId,'SUBMIT', data);
-      form.reset();
     }
 
     function postAction(action){
