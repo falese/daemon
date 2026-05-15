@@ -1,7 +1,10 @@
-import { ApolloServer } from 'apollo-server-express';
+import { ApolloServer } from '@apollo/server';
+import { expressMiddleware } from '@as-integrations/express4';
+import { ApolloServerPluginDrainHttpServer } from '@apollo/server/plugin/drainHttpServer';
 import { createServer } from 'http';
 import { useServer } from 'graphql-ws/use/ws';
 import express from 'express';
+import cors from 'cors';
 import { WebSocketServer } from 'ws';
 
 import { schema } from './schema/index.js';
@@ -14,8 +17,6 @@ export async function startServer({ mongoUri, port }) {
   const app = express();
   const httpServer = createServer(app);
 
-  app.use(express.json());
-
   app.get('/', (_req, res) => {
     res.json({
       service: 'control-plane-graph',
@@ -24,20 +25,42 @@ export async function startServer({ mongoUri, port }) {
     });
   });
 
-  const apollo = new ApolloServer({
-    schema,
-    context: () => ({ loaders: buildLoaders() })
-  });
-  await apollo.start();
-  apollo.applyMiddleware({ app, path: '/graphql' });
-
+  // Subscriptions: graphql-transport-ws over the same /graphql path.
   const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
-  useServer(
+  const wsCleanup = useServer(
     {
       schema,
       context: () => ({ loaders: buildLoaders() })
     },
     wsServer
+  );
+
+  const apollo = new ApolloServer({
+    schema,
+    plugins: [
+      // Drain HTTP connections gracefully on shutdown.
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      // Also dispose the ws server when Apollo stops.
+      {
+        async serverWillStart() {
+          return {
+            async drainServer() {
+              await wsCleanup.dispose();
+            }
+          };
+        }
+      }
+    ]
+  });
+  await apollo.start();
+
+  app.use(
+    '/graphql',
+    cors(),
+    express.json(),
+    expressMiddleware(apollo, {
+      context: async () => ({ loaders: buildLoaders() })
+    })
   );
 
   await new Promise((resolve) => httpServer.listen(port, '0.0.0.0', resolve));
@@ -46,7 +69,6 @@ export async function startServer({ mongoUri, port }) {
 
   async function stop() {
     await apollo.stop();
-    wsServer.close();
     await new Promise((resolve) => httpServer.close(resolve));
     await disconnect();
   }

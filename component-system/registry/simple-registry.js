@@ -12,12 +12,15 @@
 //   POST /graphql         – GraphQL over HTTP (queries + mutations)
 //   WS   /graphql         – GraphQL over WebSocket (subscriptions, graphql-transport-ws)
 
-import { ApolloServer } from 'apollo-server-express';
+import { ApolloServer } from '@apollo/server';
+import { expressMiddleware } from '@as-integrations/express4';
+import { ApolloServerPluginDrainHttpServer } from '@apollo/server/plugin/drainHttpServer';
 import { createServer } from 'http';
 import { useServer } from 'graphql-ws/use/ws';
 import { makeExecutableSchema } from '@graphql-tools/schema';
 import { PubSub } from 'graphql-subscriptions';
 import express from 'express';
+import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 import { WebSocketServer } from 'ws';
 
@@ -325,10 +328,6 @@ async function startRegistry(port = 4000) {
 
   const schema = makeExecutableSchema({ typeDefs, resolvers: createResolvers(registry) });
 
-  const server = new ApolloServer({ schema, context: () => ({ registry }) });
-  await server.start();
-  server.applyMiddleware({ app, path: '/graphql' });
-
   // WebSocket server (graphql-transport-ws protocol)
   const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
 
@@ -339,7 +338,7 @@ async function startRegistry(port = 4000) {
     console.log('🔌 Registry: WS connection, protocol:', req.headers['sec-websocket-protocol']);
   });
 
-  useServer({
+  const wsCleanup = useServer({
     schema,
     context: () => ({ registry }),
     onConnect: (ctx) => {
@@ -352,6 +351,31 @@ async function startRegistry(port = 4000) {
       console.error('❌ Registry: graphql-ws error:', errors);
     }
   }, wsServer);
+
+  const server = new ApolloServer({
+    schema,
+    plugins: [
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      {
+        async serverWillStart() {
+          return {
+            async drainServer() {
+              await wsCleanup.dispose();
+            }
+          };
+        }
+      }
+    ]
+  });
+  await server.start();
+  app.use(
+    '/graphql',
+    cors(),
+    express.json(),
+    expressMiddleware(server, {
+      context: async () => ({ registry })
+    })
+  );
 
   httpServer.listen(resolvedPort, '0.0.0.0', () => {
     console.log(`🚀 Registry listening on http://0.0.0.0:${resolvedPort}`);
