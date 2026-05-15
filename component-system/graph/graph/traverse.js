@@ -30,10 +30,13 @@ export async function availableTransitions(state, ctx) {
 const MAX_DEPTH = parseInt(process.env.GRAPH_MAX_DEPTH || '24', 10);
 
 export function enforceDepth(info, max = MAX_DEPTH) {
+  // Count only field-name hops, not list indices. `info.path` is a linked list
+  // where entries inside a list have a numeric `key`; counting those would make
+  // the cap depend on tree width instead of recursive depth.
   let depth = 0;
   let p = info.path;
   while (p) {
-    depth += 1;
+    if (typeof p.key !== 'number') depth += 1;
     p = p.prev;
   }
   if (depth > max) {

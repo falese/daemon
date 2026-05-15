@@ -55,8 +55,11 @@ services:
 
   mongo:
     image: mongo:7
+    # Bind to localhost only — the `graph` service reaches mongo over the
+    # internal `component-network`, so the host mapping is for local tooling only
+    # (mongo shell, Compass) and should not be exposed to the LAN.
     ports:
-      - 27017:27017
+      - 127.0.0.1:27017:27017
     volumes:
       - mongo-data:/data/db
     networks:

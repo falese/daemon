@@ -56,6 +56,18 @@ export const MutationResolvers = {
   },
 
   addChildLayout: async (_p, { parentLayoutId, childLayoutId }) => {
+    if (parentLayoutId === childLayoutId) {
+      throw new Error('Layout cannot contain itself');
+    }
+    const [parentExists, childExists] = await Promise.all([
+      Layout.exists({ _id: parentLayoutId }),
+      Layout.exists({ _id: childLayoutId })
+    ]);
+    if (!parentExists) throw new Error(`Layout ${parentLayoutId} not found`);
+    if (!childExists) throw new Error(`Layout ${childLayoutId} not found`);
+    // Full ancestor-walk cycle detection is deferred: enforceDepth() in the
+    // query path already prevents infinite recursion. A cycle would surface
+    // as a MAX_DEPTH_EXCEEDED error on the affected subtree.
     await Layout.updateOne(
       { _id: parentLayoutId },
       { $push: { children: { kind: 'Layout', ref: childLayoutId } } }
@@ -64,8 +76,17 @@ export const MutationResolvers = {
   },
 
   addChildComponent: async (_p, { parentId, parentKind, childComponentId }) => {
-    const Model = parentKind === 'Layout' ? Layout : Component;
-    await Model.updateOne(
+    if (parentKind === 'Component' && parentId === childComponentId) {
+      throw new Error('Component cannot contain itself');
+    }
+    const ParentModel = parentKind === 'Layout' ? Layout : Component;
+    const [parentExists, childExists] = await Promise.all([
+      ParentModel.exists({ _id: parentId }),
+      Component.exists({ _id: childComponentId })
+    ]);
+    if (!parentExists) throw new Error(`${parentKind} ${parentId} not found`);
+    if (!childExists) throw new Error(`Component ${childComponentId} not found`);
+    await ParentModel.updateOne(
       { _id: parentId },
       { $push: { children: { kind: 'Component', ref: childComponentId } } }
     );
@@ -103,38 +124,68 @@ export const MutationResolvers = {
 
   mutateState: async (_p, { id, action }, ctx) => {
     const stateId = id;
-    const state = await StateObject.findById(stateId);
-    if (!state) throw new Error(`StateObject ${stateId} not found`);
 
-    // Merge inbound action data into the state, increment version.
-    if (action.data && typeof action.data === 'object') {
-      state.data = { ...(state.data || {}), ...action.data };
+    // Snapshot the state to decide what (if anything) needs to change.
+    const snapshot = await StateObject.findById(stateId).lean();
+    if (!snapshot) throw new Error(`StateObject ${stateId} not found`);
+
+    const edge = await resolveTransition(snapshot, action.type, ctx);
+    const willTransition =
+      !!edge && !(snapshot.satisfiedEdgeIds || []).includes(edge._id);
+
+    const hasActionData =
+      action.data && typeof action.data === 'object' &&
+      Object.keys(action.data).length > 0;
+
+    // True no-op: no matching/unsatisfied edge AND no action payload.
+    // Skip the write and the publish so `version` and STATE_UPDATED stay
+    // meaningful as "this state actually changed" signals.
+    if (!willTransition && !hasActionData) {
+      const avail = await availableTransitions(snapshot, ctx);
+      return {
+        state: snapshot,
+        experience: null,
+        transitioned: false,
+        terminal: avail.length === 0
+      };
     }
-    state.version += 1;
 
-    // Look up the deterministic edge for this action from the current node.
-    const edge = await resolveTransition(state, action.type, ctx);
-    let transitioned = false;
-    if (edge && !state.satisfiedEdgeIds.includes(edge._id)) {
-      state.satisfiedEdgeIds.push(edge._id);
-      state.currentNodeId = edge.targetExperienceId;
-      state.currentNodeKind = 'Experience';
-      transitioned = true;
+    // Build a single atomic update. The CAS predicate `version: snapshot.version`
+    // prevents two concurrent actions from both observing the edge as unsatisfied
+    // and racing through it — the second writer gets null back and we throw.
+    const $set = {};
+    const update = { $inc: { version: 1 }, $set };
+    if (hasActionData) {
+      for (const [k, v] of Object.entries(action.data)) {
+        $set[`data.${k}`] = v;
+      }
+    }
+    if (willTransition) {
+      $set.currentNodeId = edge.targetExperienceId;
+      $set.currentNodeKind = 'Experience';
+      update.$addToSet = { satisfiedEdgeIds: edge._id };
     }
 
-    await state.save();
-    const savedState = state.toObject();
+    const updated = await StateObject.findOneAndUpdate(
+      { _id: stateId, version: snapshot.version },
+      update,
+      { new: true, lean: true }
+    );
+    if (!updated) {
+      throw new Error(
+        `StateObject ${stateId} was concurrently modified (expected version ${snapshot.version}); retry`
+      );
+    }
 
-    // Compute terminal flag against the (possibly new) current node.
-    const avail = await availableTransitions(savedState, ctx);
+    const avail = await availableTransitions(updated, ctx);
     const terminal = avail.length === 0;
 
     let experience = null;
-    if (savedState.currentNodeKind === 'Experience') {
-      experience = await ctx.loaders.experienceById.load(savedState.currentNodeId);
+    if (updated.currentNodeKind === 'Experience') {
+      experience = await ctx.loaders.experienceById.load(updated.currentNodeId);
     }
 
-    if (transitioned && experience) {
+    if (willTransition && experience) {
       pubsub.publish(TOPICS.EXPERIENCE_UPDATED(stateId), {
         experienceUpdated: {
           stateId,
@@ -144,9 +195,9 @@ export const MutationResolvers = {
         }
       });
     }
-    pubsub.publish(TOPICS.STATE_UPDATED(stateId), { stateUpdated: savedState });
+    pubsub.publish(TOPICS.STATE_UPDATED(stateId), { stateUpdated: updated });
 
-    return { state: savedState, experience, transitioned, terminal };
+    return { state: updated, experience, transitioned: willTransition, terminal };
   },
 
   resetState: async (_p, { id }) => {
