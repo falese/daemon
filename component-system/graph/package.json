@@ -1,0 +1,33 @@
+{
+  "name": "control-plane-graph",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Recursive GraphQL state-machine + experience graph for the control plane daemon demo",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --runInBand"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {},
+    "testTimeout": 60000
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@graphql-tools/schema": "^10.0.25",
+    "apollo-server-express": "^3.13.0",
+    "dataloader": "^2.2.3",
+    "express": "^4.21.2",
+    "graphql": "^16.11.0",
+    "graphql-subscriptions": "^3.0.0",
+    "graphql-ws": "^6.0.6",
+    "mongoose": "^8.8.0",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "mongodb-memory-server": "^10.1.2"
+  }
+}
