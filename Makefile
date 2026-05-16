@@ -1,7 +1,9 @@
 .DEFAULT_GOAL := help
 
 DOCKER_COMPOSE ?= docker compose
-SERVICES = registry rust-daemon node-daemon react-renderer html-renderer
+DAEMONS        = rust-daemon node-daemon
+OTHER_SERVICES = registry react-renderer html-renderer mongo graph
+SERVICES       = $(DAEMONS) $(OTHER_SERVICES)
 
 # =====================
 # High-level Targets
@@ -15,12 +17,13 @@ help:
 	 echo "  make all              Build then start registry"; \
 	 echo "  make stack            Interactive launcher (registry + chosen daemon/renderer)"; \
 	 echo "  make registry         Start registry"; \
-	 echo "  make rust-daemon      Start Rust daemon"; \
-	 echo "  make node-daemon      Start Node daemon"; \
+	 echo "  make rust-daemon      Start Rust daemon (also starts graph + mongo)"; \
+	 echo "  make node-daemon      Start Node daemon (also starts graph + mongo)"; \
+	 echo "  make graph            Start graph service + mongo only"; \
 	 echo "  make react-renderer   Start React renderer"; \
 	 echo "  make html-renderer    Start HTML renderer"; \
 	 echo "  make logs             Follow all logs"; \
-	 echo "  make logs-<svc>       Follow one service (e.g. logs-registry)"; \
+	 echo "  make logs-<svc>       Follow one service (e.g. logs-registry, logs-graph)"; \
 	 echo "  make rules-logs       Follow registry rules / action logs"; \
 	 echo "  make form             Post sample FORM component"; \
 	 echo "  make action FORM_ID=  Send SUBMIT action for given FORM component"; \
@@ -73,7 +76,13 @@ stack: registry
 	echo "\nStack running. Use 'make logs' or 'make rules-logs'."
 
 # Service start targets
-$(SERVICES):
+$(OTHER_SERVICES):
+	$(DOCKER_COMPOSE) up -d $@
+
+# Daemons also bring up the graph service (which transitively starts mongo
+# via docker-compose depends_on). Either daemon serves the existing rules-engine
+# flow on the registry, while the graph state-machine becomes available on :4100.
+$(DAEMONS): graph
 	$(DOCKER_COMPOSE) up -d $@
 
 rebuild-%:

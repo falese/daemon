@@ -53,6 +53,35 @@ services:
     networks:
       - component-network
 
+  mongo:
+    image: mongo:7
+    # Bind to localhost only — the `graph` service reaches mongo over the
+    # internal `component-network`, so the host mapping is for local tooling only
+    # (mongo shell, Compass) and should not be exposed to the LAN.
+    ports:
+      - 127.0.0.1:27017:27017
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - component-network
+
+  graph:
+    build:
+      context: ./component-system/graph
+      dockerfile: Dockerfile
+    ports:
+      - 4100:4100
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/daemon-graph
+      - GRAPH_PORT=4100
+    depends_on:
+      - mongo
+    networks:
+      - component-network
+
+volumes:
+  mongo-data:
+
 networks:
   component-network:
     driver: bridge
