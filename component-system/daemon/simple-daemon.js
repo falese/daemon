@@ -46,6 +46,12 @@ const MessageKind      = Object.freeze({
   ACTION_ECHO:      'ACTION_ECHO'
 });
 
+// Component types that carry canonical control-plane payloads over the legacy
+// envelope during migration (ADR-054 / PLATFORM-CONTRACT v3.2).
+const RESOLUTION_COMPONENT_TYPE       = 'RESOLUTION';
+const EXPERIENCE_COMPONENT_TYPE       = 'EXPERIENCE';
+const RESOLUTION_ERROR_COMPONENT_TYPE = 'RESOLUTION_ERROR';
+
 // ── Logger ────────────────────────────────────────────────────────────────────
 // Structured logger with optional JSON output (set LOG_JSON=1).
 // Each call takes a fields object and a human-readable message string.
@@ -83,6 +89,12 @@ class ComponentDaemon {
     this.registrySocket = null;
     this.registryReconnectAttempt = 0;
     this.stopping = false;
+
+    // Resolution pipeline state (ADR-054 / PLATFORM-CONTRACT v3.2):
+    this.sessions          = new Map(); // sessionId -> SessionContext from the last action that carried one
+    this.activeResolutions = new Map(); // sessionKey -> { mfe, capability } driving render-vs-refresh
+    this.loadedMfes        = new Set(); // MFE names whose load() has completed (load runs once per MFE)
+    this.mfeDirectory      = new Map(); // mfeName -> MfeRegistration, synced from the registry's GET /mfes
   }
 
   start() {
@@ -194,6 +206,13 @@ class ComponentDaemon {
     logger.info({ code: 'DAE-220', event: 'ACTION_RECEIVED', actionId: action.id, compId: action.componentId, actionType: action.actionType },
       'Action received from renderer');
 
+    // Step 1b: Capture session context. Later RESOLUTION components only
+    // carry a sessionId — the daemon rehydrates the full SessionContext
+    // (user, jwt, application, locale) when invoking the resolved MFE.
+    if (action.context && action.context.sessionId) {
+      this.sessions.set(action.context.sessionId, action.context);
+    }
+
     // Step 2: Record in local state
     const state = this.componentState.get(action.componentId);
     if (state) {
@@ -245,15 +264,187 @@ class ComponentDaemon {
   }
 
   // ── Inbound component from Registry subscription ───────────────────────────
+  // Two cases (ADR-054 / PLATFORM-CONTRACT v3.2):
+  //   RESOLUTION component → run the resolution pipeline (authorize →
+  //   load/render/refresh the resolved MFE → relay its experience)
+  //   anything else → store-then-broadcast (EXPERIENCE passthrough + legacy)
 
   handleComponentFromRegistry(component) {
     if (!component || !component.id) return;
+
+    if (component.type === RESOLUTION_COMPONENT_TYPE && component.data && component.data.mfe) {
+      this.handleResolution(component.data).catch(err => {
+        logger.error({ code: 'DAE-299', event: 'RESOLUTION_ERROR', mfe: component.data.mfe, error: err?.message },
+          'Resolution pipeline failed');
+      });
+      return;
+    }
+
     this.storeComponent(component);
     this.publish(this.buildMessage({
       direction: MessageDirection.COMPONENT,
       kind: MessageKind.COMPONENT_UPDATE,
       payload: component
     }));
+  }
+
+  // ── Resolution pipeline ─────────────────────────────────────────────────────
+  // JS port of DaemonService.handleResolution in @control-plane/contracts —
+  // the order is a protocol invariant: lookup → authorize → (load once) →
+  // render | refresh → relay the RenderedExperience as an EXPERIENCE component.
+
+  async handleResolution(data) {
+    const { mfe, capability, props } = data;
+    const correlationId = data.correlationId || uuidv4();
+    const sessionKey    = data.sessionId || 'default';
+    const session       = data.sessionId ? this.sessions.get(data.sessionId) : undefined;
+
+    logger.info({ code: 'DAE-250', event: 'RESOLUTION_RECEIVED', mfe, capability, correlationId },
+      'Registry resolved an MFE for the current state');
+
+    try {
+      // Step 1: Lookup the MFE's capability endpoints
+      const registration = await this.lookupMfe(mfe);
+      if (!registration) {
+        this.publishResolutionError(data, correlationId, `unknown MFE "${mfe}"`);
+        return;
+      }
+
+      // Step 2: Authorize with the session's JWT/user context
+      const authorized = await this.invokeMfeAuthorize(registration, session, correlationId);
+      if (!authorized) {
+        this.publishResolutionError(data, correlationId, 'access denied');
+        return;
+      }
+
+      // Step 4 (refresh branch): same MFE + capability already active → refresh
+      const active = this.activeResolutions.get(sessionKey);
+      if (active && active.mfe === mfe && active.capability === capability) {
+        await this.invokeMfe(registration, '/refresh', session, correlationId,
+          { full: false, capability, props: props || {} });
+        logger.info({ code: 'DAE-252', event: 'MFE_REFRESHED', mfe, capability }, 'MFE refreshed in place');
+        return;
+      }
+
+      // Step 3: Load once per MFE before its first render
+      if (!this.loadedMfes.has(mfe)) {
+        await this.invokeMfe(registration, '/load', session, correlationId, { config: {} });
+        this.loadedMfes.add(mfe);
+        logger.info({ code: 'DAE-251', event: 'MFE_LOADED', mfe }, 'MFE loaded');
+      }
+
+      // Step 4 (render branch): the MFE produces its own experience
+      const body    = await this.invokeMfe(registration, '/render', session, correlationId,
+        { capability, props: props || {} });
+      const element = (body && body.element) || {};
+      const experience = {
+        id: (body && typeof body.id === 'string') ? body.id : uuidv4(),
+        mfe,
+        capability,
+        output: ('output' in element) ? element.output : (body && body.element) || body,
+        contentType: typeof element.contentType === 'string'
+          ? element.contentType
+          : registration.contentType || 'application/json',
+        props: props || {},
+        createdAt: new Date().toISOString()
+      };
+
+      // Step 5: Relay — store + broadcast as an EXPERIENCE component
+      this.activeResolutions.set(sessionKey, { mfe, capability });
+      const experienceComponent = {
+        id: experience.id,
+        type: EXPERIENCE_COMPONENT_TYPE,
+        data: experience,
+        createdAt: experience.createdAt
+      };
+      this.storeComponent(experienceComponent);
+      this.publish(this.buildMessage({
+        direction: MessageDirection.COMPONENT,
+        kind: MessageKind.COMPONENT_UPDATE,
+        payload: experienceComponent,
+        metadata: { acknowledged: true, correlationId, error: null }
+      }));
+      logger.info({ code: 'DAE-253', event: 'EXPERIENCE_RELAYED', mfe, capability, expId: experience.id },
+        'MFE experience relayed to renderers');
+    } catch (err) {
+      this.publishResolutionError(data, correlationId, err?.message || String(err));
+    }
+  }
+
+  publishResolutionError(resolution, correlationId, reason) {
+    logger.error({ code: 'DAE-299', event: 'RESOLUTION_FAILED', mfe: resolution.mfe, reason },
+      'Resolution could not be fulfilled');
+    this.publish(this.buildMessage({
+      direction: MessageDirection.COMPONENT,
+      kind: MessageKind.COMPONENT_UPDATE,
+      payload: {
+        id: correlationId,
+        type: RESOLUTION_ERROR_COMPONENT_TYPE,
+        data: { mfe: resolution.mfe, capability: resolution.capability, reason },
+        createdAt: new Date().toISOString()
+      },
+      metadata: { acknowledged: false, correlationId, error: reason }
+    }));
+  }
+
+  // ── MFE directory + HTTP capability invocation ──────────────────────────────
+
+  registryHttpUrl() {
+    return process.env.REGISTRY_HTTP_URL ||
+      `http://${process.env.REGISTRY_HOST || 'registry'}:${process.env.REGISTRY_PORT || '4000'}`;
+  }
+
+  async lookupMfe(name) {
+    if (this.mfeDirectory.has(name)) return this.mfeDirectory.get(name);
+    try {
+      const response = await fetch(`${this.registryHttpUrl()}/mfes`);
+      if (response.ok) {
+        const { mfes } = await response.json();
+        for (const registration of mfes || []) this.mfeDirectory.set(registration.name, registration);
+      }
+    } catch (err) {
+      logger.warn({ code: 'DAE-254', event: 'MFE_DIRECTORY_SYNC_FAILED', error: err?.message },
+        'Could not sync MFE directory from registry');
+    }
+    return this.mfeDirectory.get(name) || null;
+  }
+
+  async invokeMfeAuthorize(registration, session, correlationId) {
+    if (!Array.isArray(registration.capabilities) || !registration.capabilities.includes('authorizeAccess')) {
+      return true; // MFEs that don't declare authorizeAccess are open
+    }
+    const body = await this.invokeMfe(registration, '/authorize', session, correlationId,
+      { token: (session && session.jwt) || null, context: this.mfeContext(session, correlationId) });
+    return body && body.authorized === true;
+  }
+
+  mfeContext(session, correlationId) {
+    return {
+      requestId:   correlationId,
+      sessionId:   (session && session.sessionId) || null,
+      user:        (session && session.user) || null,
+      application: (session && session.application) || null,
+      locale:      (session && session.locale) || null
+    };
+  }
+
+  async invokeMfe(registration, path, session, correlationId, inputs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FORWARD_TIMEOUT_MS);
+    try {
+      const headers = { 'content-type': 'application/json' };
+      if (session && session.jwt) headers.authorization = `Bearer ${session.jwt}`;
+      const response = await fetch(`${registration.baseUrl.replace(/\/$/, '')}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ inputs, context: this.mfeContext(session, correlationId) }),
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error(`MFE ${registration.name}${path} responded ${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ── Local state ────────────────────────────────────────────────────────────
@@ -530,4 +721,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startDaemon };
+module.exports = { startDaemon, ComponentDaemon };

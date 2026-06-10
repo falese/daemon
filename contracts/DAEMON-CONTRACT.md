@@ -213,6 +213,61 @@ propagating to the renderer.
 
 ---
 
+## The resolution pipeline (ADR-054 / PLATFORM-CONTRACT v3.2)
+
+The wire protocol is now defined once in `@seans-mfe/contracts` (the
+seans-mfe-tool platform contracts package, consumed here as a vendored
+tarball — see `vendor/`) and re-exported by this package. On top of the
+action pipeline, `DaemonService` implements the **resolution pipeline**:
+the registry no longer only generates fixed components — it can answer a
+state change with a *resolution* `{ mfe, capability, props }`, and the
+daemon drives the resolved MFE's platform capabilities.
+
+During migration, canonical payloads ride the legacy component envelope:
+
+| Component `type` | `data` payload | Meaning |
+|---|---|---|
+| `RESOLUTION` | `Resolution` + `sessionId?`, `correlationId?` | Registry chose an MFE for the current state |
+| `EXPERIENCE` | `RenderedExperience` | What the resolved MFE's `render()` produced |
+| `RESOLUTION_ERROR` | `{ mfe, capability, reason }` | The daemon could not fulfil a resolution |
+
+`DaemonService.handleResolution()` is concrete — the order is a protocol
+invariant:
+
+```
+Registry                      DaemonService                          MFE
+  | componentUpdate            |                                      |
+  | (type: RESOLUTION) ───────►| Step 1: mfeDirectory.lookup(mfe)     |
+  |                            | Step 2: invoker.authorizeAccess() ──►| /authorize (JWT)
+  |                            | Step 3: invoker.load()  [once] ─────►| /load
+  |                            | Step 4: invoker.render() ───────────►| /render (capability, props)
+  |                            |   — or refresh() when the same       |
+  |                            |     MFE+capability is already        |
+  |                            |     active for this session          |
+  |                            | Step 5: publish COMPONENT_UPDATE     |
+  |                            |   (type: EXPERIENCE, the MFE's       |
+  |                            |    RenderedExperience)               |
+```
+
+**Sessions and user context.** Actions may carry a `context: SessionContext`
+(sessionId, user, jwt, application, locale). The daemon caches it
+(`sessions` map) and the registry threads the `sessionId` back on each
+resolution, so the daemon invokes the MFE *for that user, in that
+application* — the same state change can resolve different experiences for
+different users. Render-vs-refresh is decided per session.
+
+**Collaborators.** `MfeDirectory` (where does the resolved MFE live —
+default `StaticMfeDirectory`, seeded from `DaemonServiceConfig.mfes`) and
+`MfeInvoker` (how its capabilities are called — default `HttpMfeInvoker`,
+which POSTs to the standard `/authorize` `/load` `/render` `/refresh`
+endpoints of an SMT-generated MFE). Both are injectable for tests and for
+non-HTTP delivery mechanisms.
+
+Run the contract tests with `make contracts-test`
+(`contracts/__tests__/daemon-service.test.js`).
+
+---
+
 ## Connection to the MFE
 
 The MFE framework (`@seans-mfe-tool/runtime`) connects to this control plane

@@ -38,7 +38,21 @@ import {
   MessageKind,
   MessageMetadata,
   DaemonConfig,
+  MfeRegistration,
+  RenderedExperience,
+  Resolution,
+  SessionContext,
+  RESOLUTION_ERROR_COMPONENT_TYPE,
+  resolutionFromComponent,
+  toExperienceComponent,
 } from './types';
+import {
+  HttpMfeInvoker,
+  MfeDirectory,
+  MfeInvocationContext,
+  MfeInvoker,
+  StaticMfeDirectory,
+} from './MfeInvoker';
 
 // Re-export so consumers only need a single import path.
 export type {
@@ -50,7 +64,26 @@ export type {
   MessageKind,
   MessageMetadata,
   DaemonConfig,
+  MfeRegistration,
+  RenderedExperience,
+  Resolution,
+  SessionContext,
 };
+
+/**
+ * DaemonService configuration: the canonical DaemonConfig plus the MFE
+ * registrations that seed the daemon's directory (ADR-054 / PLATFORM-CONTRACT
+ * v3.2). Registrations may also arrive at runtime via the registry.
+ */
+export interface DaemonServiceConfig extends DaemonConfig {
+  mfes?: MfeRegistration[];
+}
+
+/** Environment-specific collaborators a daemon implementation may inject. */
+export interface DaemonServiceDeps {
+  mfeInvoker?: MfeInvoker;
+  mfeDirectory?: MfeDirectory;
+}
 
 // ── Default reconnect constants ──────────────────────────────
 // These match the values in simple-daemon.js and main.rs exactly.
@@ -89,6 +122,29 @@ export abstract class DaemonService {
    */
   protected stopping = false;
 
+  /**
+   * Known sessions: sessionId → the SessionContext from the most recent
+   * action that carried one. Threaded into MFE capability calls so the
+   * resolved MFE renders for THIS user, application, and locale.
+   */
+  protected sessions: Map<string, SessionContext> = new Map();
+
+  /**
+   * The currently active resolution per session ('default' when an action
+   * carried no session). Drives the render-vs-refresh decision: the same
+   * MFE+capability resolving again means refresh, not re-render.
+   */
+  protected activeResolutions: Map<string, { mfe: string; capability: string }> = new Map();
+
+  /** MFEs that have completed `load()` — load runs once per MFE, not per render. */
+  protected loadedMfes: Set<string> = new Set();
+
+  /** Where resolved MFE names are looked up. */
+  protected readonly mfeDirectory: MfeDirectory;
+
+  /** How the daemon drives a resolved MFE's platform capabilities. */
+  protected readonly mfeInvoker: MfeInvoker;
+
   // ── Read-only config ─────────────────────────────────────
   protected readonly registryUrl: string;
   protected readonly port: number;
@@ -97,13 +153,15 @@ export abstract class DaemonService {
   protected readonly reconnectFactor: number;
   protected readonly forwardTimeoutMs: number;
 
-  constructor(config: DaemonConfig = {}) {
+  constructor(config: DaemonServiceConfig = {}, deps: DaemonServiceDeps = {}) {
     this.registryUrl     = config.registryUrl    ?? 'ws://registry:4000/graphql';
     this.port            = config.port           ?? 3001;
     this.reconnectBaseMs = config.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS;
     this.reconnectMaxMs  = config.reconnectMaxMs  ?? DEFAULT_RECONNECT_MAX_MS;
     this.reconnectFactor = config.reconnectFactor ?? DEFAULT_RECONNECT_FACTOR;
     this.forwardTimeoutMs = config.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
+    this.mfeDirectory = deps.mfeDirectory ?? new StaticMfeDirectory(config.mfes ?? []);
+    this.mfeInvoker   = deps.mfeInvoker   ?? new HttpMfeInvoker({ timeoutMs: this.forwardTimeoutMs });
   }
 
   // ============================================================
@@ -265,6 +323,13 @@ export abstract class DaemonService {
     const raw    = envelope.payload as ActionRecord;
     const action = this.normalizeActionType(raw);
 
+    // Step 1b: Capture session context. The registry resolves per user/app,
+    // and later resolutions only carry a sessionId — the daemon must be able
+    // to rehydrate the full SessionContext when invoking the resolved MFE.
+    if (action.context?.sessionId) {
+      this.sessions.set(action.context.sessionId, action.context);
+    }
+
     // Step 2: Record in local state
     const state = this.componentState.get(action.componentId);
     if (state) {
@@ -336,18 +401,148 @@ export abstract class DaemonService {
    * Called by `connectToRegistry()` when a `next` frame arrives containing
    * a componentUpdate event from the Registry subscription.
    *
-   * Stores the component and broadcasts to all renderers.
+   * Two cases (ADR-054 / PLATFORM-CONTRACT v3.2):
+   *   1. RESOLUTION component — the registry answered "which MFE should
+   *      handle this state?". Run the resolution pipeline: authorize →
+   *      load/render/refresh the resolved MFE → relay its experience.
+   *   2. Anything else — store-then-broadcast (EXPERIENCE passthrough and
+   *      legacy CARD/FORM/NOTIFICATION components during migration).
    *
-   * WHY concrete: same store-then-broadcast pattern regardless of direction.
+   * WHY concrete: the routing rule and the pipeline are protocol invariants.
    */
-  protected handleComponentFromRegistry(component: Component): void {
+  protected async handleComponentFromRegistry(component: Component): Promise<void> {
     if (!component?.id) return;
+
+    const resolution = resolutionFromComponent(component);
+    if (resolution) {
+      await this.handleResolution(resolution, {
+        correlationId: resolution.correlationId,
+        sessionId:     resolution.sessionId,
+      });
+      return;
+    }
+
     this.storeComponent(component);
     this.publish(this.buildMessage({
       direction: 'COMPONENT',
       kind:      'COMPONENT_UPDATE',
       payload:   component,
     }));
+  }
+
+  // ============================================================
+  // RESOLUTION PIPELINE — CONCRETE
+  // The registry decides WHICH MFE handles a state change; the
+  // daemon drives the resolved MFE's platform capabilities and
+  // relays whatever the MFE produced. The order is a protocol
+  // invariant: authorize → (load once) → render | refresh → relay.
+  // ============================================================
+
+  /**
+   * Fulfil a registry resolution `{mfe, capability, props}`.
+   *
+   *   Step 1 — Lookup:    find the MFE's registration (capability endpoints)
+   *   Step 2 — Authorize: gate check with the session's JWT/user context
+   *   Step 3 — Load:      once per MFE, before its first render
+   *   Step 4 — Render or Refresh: refresh when the same MFE+capability is
+   *            already active for this session; render otherwise
+   *   Step 5 — Relay:     store + broadcast the RenderedExperience as a
+   *            COMPONENT_UPDATE (type EXPERIENCE) with the originating
+   *            correlationId
+   *
+   * Failures publish a RESOLUTION_ERROR component with `metadata.error` set
+   * so renderers can surface the failure, and call `onResolutionError()`.
+   */
+  protected async handleResolution(
+    resolution: Resolution,
+    opts: { correlationId?: string; sessionId?: string } = {},
+  ): Promise<void> {
+    const correlationId = opts.correlationId ?? this.generateId();
+    const sessionKey    = opts.sessionId ?? 'default';
+    const session       = opts.sessionId ? this.sessions.get(opts.sessionId) : undefined;
+    const context: MfeInvocationContext = { correlationId, session };
+
+    try {
+      // Step 1: Lookup
+      const registration = await this.mfeDirectory.lookup(resolution.mfe);
+      if (!registration) {
+        this.publishResolutionError(resolution, correlationId, `unknown MFE "${resolution.mfe}"`);
+        return;
+      }
+
+      // Step 2: Authorize
+      const authorized = await this.mfeInvoker.authorizeAccess(registration, context);
+      if (!authorized) {
+        this.publishResolutionError(resolution, correlationId, 'access denied');
+        return;
+      }
+
+      // Step 4 (refresh branch): same MFE + capability already active → refresh
+      const active = this.activeResolutions.get(sessionKey);
+      if (active && active.mfe === resolution.mfe && active.capability === resolution.capability) {
+        await this.mfeInvoker.refresh(registration, resolution, context);
+        return;
+      }
+
+      // Step 3: Load (once per MFE)
+      if (!this.loadedMfes.has(resolution.mfe)) {
+        await this.mfeInvoker.load(registration, context);
+        this.loadedMfes.add(resolution.mfe);
+      }
+
+      // Step 4 (render branch)
+      const experience = await this.mfeInvoker.render(registration, resolution, context);
+
+      // Step 5: Relay
+      this.activeResolutions.set(sessionKey, {
+        mfe: resolution.mfe,
+        capability: resolution.capability,
+      });
+      const component = toExperienceComponent(experience);
+      this.storeComponent(component);
+      this.publish(this.buildMessage({
+        direction: 'COMPONENT',
+        kind:      'COMPONENT_UPDATE',
+        payload:   component,
+        metadata:  { correlationId, acknowledged: true, error: null },
+      }));
+    } catch (error) {
+      this.publishResolutionError(
+        resolution,
+        correlationId,
+        error instanceof Error ? error.message : String(error),
+      );
+      this.onResolutionError(resolution, error);
+    }
+  }
+
+  /** Broadcast a resolution failure so renderers can surface it. */
+  private publishResolutionError(
+    resolution: Resolution,
+    correlationId: string,
+    reason: string,
+  ): void {
+    this.publish(this.buildMessage({
+      direction: 'COMPONENT',
+      kind:      'COMPONENT_UPDATE',
+      payload:   {
+        id:        correlationId,
+        type:      RESOLUTION_ERROR_COMPONENT_TYPE,
+        data:      { mfe: resolution.mfe, capability: resolution.capability, reason },
+        createdAt: new Date().toISOString(),
+      },
+      metadata: { correlationId, acknowledged: false, error: reason },
+    }));
+  }
+
+  /**
+   * Hook called when the resolution pipeline throws.
+   *
+   * Default: no-op (the error has already been published to renderers).
+   * Override to add structured logging, metrics, or retries.
+   */
+  protected onResolutionError(_resolution: Resolution, _error: unknown): void {
+    // intentional no-op — override to add observability
   }
 
   // ============================================================

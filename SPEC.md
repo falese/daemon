@@ -184,6 +184,40 @@ interface Rule {
 | `card-click` | CARD component + CLICK action | NOTIFICATION component |
 | `form-submit` | FORM component + SUBMIT action | CARD component with submitted data |
 
+### MFE Resolution Routes (PLATFORM-CONTRACT v3.2 / ADR-054)
+
+The registry also acts as the **MFE selector** for the seans-mfe-tool
+platform. An MFE registers itself (its `describe()` output) plus declarative
+routes via `POST /mfes` (or the `registerMfe` mutation):
+
+```json
+{
+  "registration": {
+    "name": "csv-analyzer", "version": "1.0.0", "type": "tool",
+    "baseUrl": "http://csv-analyzer:8000",
+    "capabilities": ["authorizeAccess", "load", "render", "refresh"]
+  },
+  "routes": [
+    { "when": { "componentType": "FORM", "actionType": "SUBMIT" },
+      "resolve": { "capability": "DataAnalysis", "props": { "mode": "full" } } },
+    { "when": { "stateKey": "analysis.complete" },
+      "resolve": { "capability": "Visualization" } }
+  ]
+}
+```
+
+Each route becomes a rule that generates a `RESOLUTION` component
+`{ mfe, capability, props, sessionId, correlationId }`. The daemon picks it
+up, authorizes, loads (once), renders (or refreshes) the MFE over its
+capability endpoints, and relays the MFE-owned `RenderedExperience` to
+renderers as an `EXPERIENCE` component — per user session, in any host
+application. Actions may carry `context: SessionContext` (sessionId, user,
+jwt, application, locale) so rules and MFEs see who acted and where.
+
+The wire protocol types live in `@seans-mfe/contracts` and are re-exported
+by `@control-plane/contracts` (see `contracts/DAEMON-CONTRACT.md` § "The
+resolution pipeline").
+
 ---
 
 ## Data Flows
