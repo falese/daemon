@@ -40,7 +40,16 @@ const MUTATION_TIMEOUT_SECS: u64 = 3;
 /// How long to wait between registry reconnect attempts.
 const RECONNECT_DELAY_SECS: u64 = 2;
 
+/// Deadline for an MFE capability call (/authorize, /load, /render, /refresh).
+const MFE_CALL_TIMEOUT_SECS: u64 = 4;
+
 const GRAPHQL_SUBPROTOCOL: &str = "graphql-transport-ws";
+
+// Component types that carry canonical control-plane payloads over the legacy
+// envelope during migration (ADR-054 / PLATFORM-CONTRACT v3.2).
+const RESOLUTION_COMPONENT_TYPE: &str = "RESOLUTION";
+const EXPERIENCE_COMPONENT_TYPE: &str = "EXPERIENCE";
+const RESOLUTION_ERROR_COMPONENT_TYPE: &str = "RESOLUTION_ERROR";
 
 // ========================
 // GRAPHQL SCHEMA
@@ -116,7 +125,10 @@ pub struct MessageMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct Component {
     pub id: String,
-    pub r#type: ComponentType,
+    /// Open string per PLATFORM-CONTRACT v3.2 — the control plane does not
+    /// own a fixed component type library. Legacy CARD | NOTIFICATION | FORM
+    /// plus RESOLUTION | EXPERIENCE | RESOLUTION_ERROR all flow through here.
+    pub r#type: String,
     pub data: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
@@ -131,13 +143,6 @@ pub struct Action {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Enum, Copy, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ComponentType {
-    Card,
-    Notification,
-    Form,
-}
 
 // ========================
 // STATE
@@ -163,6 +168,20 @@ pub struct ComponentDaemon {
 
     /// Broadcast channel to fan out messages to all connected renderer subscriptions.
     broadcast_tx: broadcast::Sender<DaemonMessage>,
+
+    // ── Resolution pipeline state (ADR-054 / PLATFORM-CONTRACT v3.2) ──
+
+    /// sessionId -> SessionContext (raw JSON) from the last action that carried one.
+    sessions: Arc<DashMap<String, serde_json::Value>>,
+
+    /// sessionKey -> (mfe, capability) currently active — drives render-vs-refresh.
+    active_resolutions: Arc<DashMap<String, (String, String)>>,
+
+    /// MFE names whose load() has completed (load runs once per MFE).
+    loaded_mfes: Arc<DashMap<String, ()>>,
+
+    /// mfeName -> MfeRegistration (raw JSON), synced from the registry's GET /mfes.
+    mfe_directory: Arc<DashMap<String, serde_json::Value>>,
 }
 
 impl ComponentDaemon {
@@ -171,6 +190,10 @@ impl ComponentDaemon {
         Self {
             components: Arc::new(DashMap::new()),
             broadcast_tx,
+            sessions: Arc::new(DashMap::new()),
+            active_resolutions: Arc::new(DashMap::new()),
+            loaded_mfes: Arc::new(DashMap::new()),
+            mfe_directory: Arc::new(DashMap::new()),
         }
     }
 
@@ -200,6 +223,16 @@ impl ComponentDaemon {
 
     async fn handle_action(&self, message: DaemonMessage) -> Result<Option<DaemonMessage>> {
         let mut action: Action = serde_json::from_value(message.payload.clone())?;
+
+        // Step 1b: Capture session context (read from the raw payload — the
+        // typed Action drops unknown fields). Later RESOLUTION components only
+        // carry a sessionId; the daemon rehydrates the full SessionContext
+        // (user, jwt, application, locale) when invoking the resolved MFE.
+        if let Some(ctx) = message.payload.get("context") {
+            if let Some(sid) = ctx.get("sessionId").and_then(|v| v.as_str()) {
+                self.sessions.insert(sid.to_string(), ctx.clone());
+            }
+        }
 
         // Step 1: Normalise — retain original type in data payload
         if action.action_type == "BUTTON_CLICK" {
@@ -367,9 +400,28 @@ impl ComponentDaemon {
         Ok(Some(forward))
     }
 
-    /// Called when the registry subscription delivers a new component
+    /// Called when the registry subscription delivers a new component.
+    ///
+    /// Two cases (ADR-054 / PLATFORM-CONTRACT v3.2):
+    ///   RESOLUTION component → run the resolution pipeline (authorize →
+    ///   load/render/refresh the resolved MFE → relay its experience)
+    ///   anything else → store-then-broadcast (EXPERIENCE passthrough + legacy)
     async fn handle_component_from_registry(&self, component: Component) -> Result<()> {
         info!("DAE-210 COMPONENT_FROM_REGISTRY — id={}", component.id);
+
+        if component.r#type == RESOLUTION_COMPONENT_TYPE
+            && component.data.get("mfe").and_then(|v| v.as_str()).is_some()
+        {
+            let daemon = self.clone();
+            let data = component.data.clone();
+            tokio::spawn(async move {
+                if let Err(e) = daemon.handle_resolution(data).await {
+                    error!("DAE-299 RESOLUTION_ERROR — {}", e);
+                }
+            });
+            return Ok(());
+        }
+
         self.components.insert(component.id.clone(), ComponentState {
             component: component.clone(),
             actions: Vec::new(),
@@ -387,6 +439,253 @@ impl ComponentDaemon {
         };
         let _ = self.broadcast_tx.send(message);
         Ok(())
+    }
+
+    // ── Resolution pipeline (ADR-054 / PLATFORM-CONTRACT v3.2) ─────────────────
+    // Rust port of DaemonService.handleResolution in @control-plane/contracts —
+    // the order is a protocol invariant: lookup → authorize → (load once) →
+    // render | refresh → relay the RenderedExperience as an EXPERIENCE component.
+
+    async fn handle_resolution(&self, data: serde_json::Value) -> Result<()> {
+        let mfe = data.get("mfe").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let capability = data.get("capability").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let props = data.get("props").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let correlation_id = data.get("correlationId").and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let session_key = data.get("sessionId").and_then(|v| v.as_str())
+            .unwrap_or("default").to_string();
+        let session = data.get("sessionId").and_then(|v| v.as_str())
+            .and_then(|sid| self.sessions.get(sid).map(|s| s.value().clone()));
+
+        info!("DAE-250 RESOLUTION_RECEIVED — mfe={} capability={} correlationId={}", mfe, capability, correlation_id);
+
+        // Step 1: Lookup the MFE's capability endpoints
+        let registration = match self.lookup_mfe(&mfe).await {
+            Some(r) => r,
+            None => {
+                self.publish_resolution_error(&mfe, &capability, &correlation_id, &format!("unknown MFE \"{mfe}\""));
+                return Ok(());
+            }
+        };
+        let base_url = registration.get("baseUrl").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let jwt = session.as_ref().and_then(|s| s.get("jwt")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let mfe_context = self.mfe_context(session.as_ref(), &correlation_id);
+
+        // Step 2: Authorize (MFEs that don't declare authorizeAccess are open)
+        let declares_authorize = registration.get("capabilities")
+            .and_then(|v| v.as_array())
+            .map(|caps| caps.iter().any(|c| c.as_str() == Some("authorizeAccess")))
+            .unwrap_or(false);
+        if declares_authorize {
+            let body = serde_json::json!({
+                "inputs": { "token": jwt, "context": mfe_context },
+                "context": mfe_context
+            });
+            match self.mfe_post(&base_url, "/authorize", jwt.as_deref(), body).await {
+                Ok(response) if response.get("authorized").and_then(|v| v.as_bool()) == Some(true) => {}
+                Ok(_) => {
+                    self.publish_resolution_error(&mfe, &capability, &correlation_id, "access denied");
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.publish_resolution_error(&mfe, &capability, &correlation_id, &e.to_string());
+                    return Ok(());
+                }
+            }
+        }
+
+        // Step 4 (refresh branch): same MFE + capability already active → refresh
+        let already_active = self.active_resolutions.get(&session_key)
+            .map(|a| a.value().0 == mfe && a.value().1 == capability)
+            .unwrap_or(false);
+        if already_active {
+            let body = serde_json::json!({
+                "inputs": { "full": false, "capability": capability, "props": props },
+                "context": mfe_context
+            });
+            if let Err(e) = self.mfe_post(&base_url, "/refresh", jwt.as_deref(), body).await {
+                self.publish_resolution_error(&mfe, &capability, &correlation_id, &e.to_string());
+            } else {
+                info!("DAE-252 MFE_REFRESHED — mfe={} capability={}", mfe, capability);
+            }
+            return Ok(());
+        }
+
+        // Step 3: Load once per MFE before its first render
+        if !self.loaded_mfes.contains_key(&mfe) {
+            let body = serde_json::json!({ "inputs": { "config": {} }, "context": mfe_context });
+            if let Err(e) = self.mfe_post(&base_url, "/load", jwt.as_deref(), body).await {
+                self.publish_resolution_error(&mfe, &capability, &correlation_id, &e.to_string());
+                return Ok(());
+            }
+            self.loaded_mfes.insert(mfe.clone(), ());
+            info!("DAE-251 MFE_LOADED — mfe={}", mfe);
+        }
+
+        // Step 4 (render branch): the MFE produces its own experience
+        let body = serde_json::json!({
+            "inputs": { "capability": capability, "props": props },
+            "context": mfe_context
+        });
+        let response = match self.mfe_post(&base_url, "/render", jwt.as_deref(), body).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.publish_resolution_error(&mfe, &capability, &correlation_id, &e.to_string());
+                return Ok(());
+            }
+        };
+
+        let element = response.get("element").cloned().unwrap_or(serde_json::Value::Null);
+        let output = element.get("output").cloned()
+            .unwrap_or_else(|| if element.is_null() { response.clone() } else { element.clone() });
+        let content_type = element.get("contentType").and_then(|v| v.as_str())
+            .or_else(|| registration.get("contentType").and_then(|v| v.as_str()))
+            .unwrap_or("application/json")
+            .to_string();
+        let experience_id = response.get("id").and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let created_at = Utc::now();
+        let experience = serde_json::json!({
+            "id": experience_id,
+            "mfe": mfe,
+            "capability": capability,
+            "output": output,
+            "contentType": content_type,
+            "props": props,
+            "createdAt": created_at.to_rfc3339()
+        });
+
+        // Step 5: Relay — store + broadcast as an EXPERIENCE component
+        self.active_resolutions.insert(session_key, (mfe.clone(), capability.clone()));
+        let component = Component {
+            id: experience_id.clone(),
+            r#type: EXPERIENCE_COMPONENT_TYPE.to_string(),
+            data: experience,
+            created_at,
+        };
+        self.components.insert(component.id.clone(), ComponentState {
+            component: component.clone(),
+            actions: Vec::new(),
+            last_updated: Utc::now(),
+        });
+        let message = DaemonMessage {
+            direction: MessageDirection::Component,
+            kind: Some(MessageKind::ComponentUpdate),
+            payload: serde_json::to_value(component)?,
+            metadata: Some(MessageMetadata {
+                acknowledged: true,
+                correlation_id: Some(correlation_id),
+                error: None,
+            }),
+        };
+        let _ = self.broadcast_tx.send(message);
+        info!("DAE-253 EXPERIENCE_RELAYED — mfe={} capability={} expId={}", mfe, capability, experience_id);
+        Ok(())
+    }
+
+    fn publish_resolution_error(&self, mfe: &str, capability: &str, correlation_id: &str, reason: &str) {
+        error!("DAE-299 RESOLUTION_FAILED — mfe={} reason={}", mfe, reason);
+        let component = serde_json::json!({
+            "id": correlation_id,
+            "type": RESOLUTION_ERROR_COMPONENT_TYPE,
+            "data": { "mfe": mfe, "capability": capability, "reason": reason },
+            "createdAt": Utc::now().to_rfc3339()
+        });
+        let _ = self.broadcast_tx.send(DaemonMessage {
+            direction: MessageDirection::Component,
+            kind: Some(MessageKind::ComponentUpdate),
+            payload: component,
+            metadata: Some(MessageMetadata {
+                acknowledged: false,
+                correlation_id: Some(correlation_id.to_string()),
+                error: Some(reason.to_string()),
+            }),
+        });
+    }
+
+    /// The subset of SessionContext the MFE's shared Context understands.
+    fn mfe_context(&self, session: Option<&serde_json::Value>, correlation_id: &str) -> serde_json::Value {
+        let get = |key: &str| session.and_then(|s| s.get(key)).cloned().unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "requestId": correlation_id,
+            "sessionId": get("sessionId"),
+            "user": get("user"),
+            "application": get("application"),
+            "locale": get("locale")
+        })
+    }
+
+    // ── MFE directory + HTTP capability invocation ──────────────────────────────
+
+    fn registry_http_url(&self) -> String {
+        std::env::var("REGISTRY_HTTP_URL").unwrap_or_else(|_| {
+            let host = std::env::var("REGISTRY_HOST").unwrap_or_else(|_| "registry".to_string());
+            let port = std::env::var("REGISTRY_PORT").unwrap_or_else(|_| "4000".to_string());
+            format!("http://{host}:{port}")
+        })
+    }
+
+    async fn lookup_mfe(&self, name: &str) -> Option<serde_json::Value> {
+        if let Some(registration) = self.mfe_directory.get(name) {
+            return Some(registration.value().clone());
+        }
+        match self.http_get(&format!("{}/mfes", self.registry_http_url())).await {
+            Ok(body) => {
+                if let Some(mfes) = body.get("mfes").and_then(|v| v.as_array()) {
+                    for registration in mfes {
+                        if let Some(reg_name) = registration.get("name").and_then(|v| v.as_str()) {
+                            self.mfe_directory.insert(reg_name.to_string(), registration.clone());
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("DAE-254 MFE_DIRECTORY_SYNC_FAILED — {}", e),
+        }
+        self.mfe_directory.get(name).map(|r| r.value().clone())
+    }
+
+    async fn http_get(&self, url: &str) -> Result<serde_json::Value> {
+        let client = hyper::Client::new();
+        let uri: hyper::Uri = url.parse()?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(MFE_CALL_TIMEOUT_SECS),
+            client.get(uri),
+        ).await??;
+        if !response.status().is_success() {
+            anyhow::bail!("GET {url} responded {}", response.status());
+        }
+        let bytes = hyper::body::to_bytes(response.into_body()).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn mfe_post(
+        &self,
+        base_url: &str,
+        path: &str,
+        jwt: Option<&str>,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let client = hyper::Client::new();
+        let uri: hyper::Uri = format!("{}{}", base_url.trim_end_matches('/'), path).parse()?;
+        let mut builder = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(jwt) = jwt {
+            builder = builder.header("authorization", format!("Bearer {jwt}"));
+        }
+        let request = builder.body(hyper::Body::from(body.to_string()))?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(MFE_CALL_TIMEOUT_SECS),
+            client.request(request),
+        ).await??;
+        if !response.status().is_success() {
+            anyhow::bail!("MFE {path} responded {}", response.status());
+        }
+        let bytes = hyper::body::to_bytes(response.into_body()).await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     // ── Renderer subscription ──────────────────────────────────────────────────
