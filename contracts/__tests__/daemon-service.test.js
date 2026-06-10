@@ -195,6 +195,46 @@ test('per-session active resolutions: a second session renders, not refreshes', 
   assert.equal(kinds.filter(k => k === 'load').length, 1);
 });
 
+test('client-side MFE (module-federation): experience synthesized, no HTTP capability calls', async () => {
+  const invoker = makeInvoker();
+  const daemon = new TestDaemon({
+    mfes: [{
+      name: 'abc-kids-flappy',
+      version: '1.0.0',
+      type: 'remote',
+      baseUrl: 'http://localhost:3001',
+      capabilities: ['load', 'render'],
+      contentType: 'module-federation',
+      remoteEntryUrl: 'http://localhost:3001/remoteEntry.js',
+      moduleFederation: { scope: 'abc_kids_flappy', module: './App', component: 'PlayGame' },
+    }],
+  }, { mfeInvoker: invoker });
+
+  await daemon.receiveFromRegistry({
+    id: 'res-mf',
+    type: RESOLUTION_COMPONENT_TYPE,
+    data: { mfe: 'abc-kids-flappy', capability: 'PlayGame', props: { slot: 'main', level: 2 }, correlationId: 'corr-mf' },
+    createdAt: new Date().toISOString(),
+  });
+
+  // The lifecycle runs in the host shell — no HTTP invocation at all
+  assert.deepEqual(invoker.calls, []);
+  const message = daemon.published[0];
+  assert.equal(message.kind, 'COMPONENT_UPDATE');
+  assert.equal(message.metadata.correlationId, 'corr-mf');
+  assert.equal(message.payload.type, EXPERIENCE_COMPONENT_TYPE);
+  const experience = experienceFromComponent(message.payload);
+  assert.equal(experience.contentType, 'module-federation');
+  assert.deepEqual(experience.output, {
+    remoteEntryUrl: 'http://localhost:3001/remoteEntry.js',
+    scope: 'abc_kids_flappy',
+    module: './App',
+    component: 'PlayGame',
+    props: { slot: 'main', level: 2 },
+  });
+  assert.deepEqual(experience.props, { slot: 'main', level: 2 });
+});
+
 // ── Legacy migration behaviour ───────────────────────────────
 
 test('legacy component passthrough: store then broadcast unchanged', async () => {

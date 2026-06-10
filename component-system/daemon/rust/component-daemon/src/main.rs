@@ -468,6 +468,59 @@ impl ComponentDaemon {
                 return Ok(());
             }
         };
+        // Client-side MFEs (module federation): the BaseMFE lifecycle runs in
+        // the host shell's LayoutManager (ADR-055), not over HTTP. Synthesize
+        // the RenderedExperience from the registration and relay immediately.
+        let is_client_side = registration.get("contentType").and_then(|v| v.as_str()) == Some("module-federation")
+            && registration.get("remoteEntryUrl").and_then(|v| v.as_str()).is_some()
+            && registration.get("moduleFederation").map(|v| v.is_object()).unwrap_or(false);
+        if is_client_side {
+            let module_federation = registration.get("moduleFederation").cloned().unwrap_or(serde_json::json!({}));
+            let component_name = module_federation.get("component").and_then(|v| v.as_str())
+                .unwrap_or(&capability).to_string();
+            let experience_id = Uuid::new_v4().to_string();
+            let created_at = Utc::now();
+            let experience = serde_json::json!({
+                "id": experience_id,
+                "mfe": mfe,
+                "capability": capability,
+                "contentType": "module-federation",
+                "output": {
+                    "remoteEntryUrl": registration.get("remoteEntryUrl"),
+                    "scope": module_federation.get("scope"),
+                    "module": module_federation.get("module"),
+                    "component": component_name,
+                    "props": props
+                },
+                "props": props,
+                "createdAt": created_at.to_rfc3339()
+            });
+            self.active_resolutions.insert(session_key, (mfe.clone(), capability.clone()));
+            let component = Component {
+                id: experience_id.clone(),
+                r#type: EXPERIENCE_COMPONENT_TYPE.to_string(),
+                data: experience,
+                created_at,
+            };
+            self.components.insert(component.id.clone(), ComponentState {
+                component: component.clone(),
+                actions: Vec::new(),
+                last_updated: Utc::now(),
+            });
+            let _ = self.broadcast_tx.send(DaemonMessage {
+                direction: MessageDirection::Component,
+                kind: Some(MessageKind::ComponentUpdate),
+                payload: serde_json::to_value(component)?,
+                metadata: Some(MessageMetadata {
+                    acknowledged: true,
+                    correlation_id: Some(correlation_id),
+                    error: None,
+                }),
+            });
+            info!("DAE-253 EXPERIENCE_RELAYED — mfe={} capability={} expId={} clientSide=true", mfe, capability, experience_id);
+            return Ok(());
+        }
+
         let base_url = registration.get("baseUrl").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let jwt = session.as_ref().and_then(|s| s.get("jwt")).and_then(|v| v.as_str()).map(|s| s.to_string());
         let mfe_context = self.mfe_context(session.as_ref(), &correlation_id);

@@ -470,6 +470,44 @@ export abstract class DaemonService {
         return;
       }
 
+      // Client-side MFEs (module federation): the BaseMFE lifecycle runs in
+      // the host shell's LayoutManager (ADR-055), not over HTTP. Synthesize
+      // the RenderedExperience from the registration and relay immediately.
+      if (
+        registration.contentType === 'module-federation' &&
+        registration.remoteEntryUrl &&
+        registration.moduleFederation
+      ) {
+        const experience: RenderedExperience = {
+          id: this.generateId(),
+          mfe: resolution.mfe,
+          capability: resolution.capability,
+          contentType: 'module-federation',
+          output: {
+            remoteEntryUrl: registration.remoteEntryUrl,
+            scope: registration.moduleFederation.scope,
+            module: registration.moduleFederation.module,
+            component: registration.moduleFederation.component ?? resolution.capability,
+            props: resolution.props,
+          },
+          props: resolution.props,
+          createdAt: new Date().toISOString(),
+        };
+        this.activeResolutions.set(sessionKey, {
+          mfe: resolution.mfe,
+          capability: resolution.capability,
+        });
+        const component = toExperienceComponent(experience);
+        this.storeComponent(component);
+        this.publish(this.buildMessage({
+          direction: 'COMPONENT',
+          kind:      'COMPONENT_UPDATE',
+          payload:   component,
+          metadata:  { correlationId, acknowledged: true, error: null },
+        }));
+        return;
+      }
+
       // Step 2: Authorize
       const authorized = await this.mfeInvoker.authorizeAccess(registration, context);
       if (!authorized) {

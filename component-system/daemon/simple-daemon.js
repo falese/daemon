@@ -310,6 +310,45 @@ class ComponentDaemon {
         return;
       }
 
+      // Client-side MFEs (module federation): the BaseMFE lifecycle runs in
+      // the host shell's LayoutManager (ADR-055), not over HTTP. Synthesize
+      // the RenderedExperience from the registration and relay immediately.
+      if (registration.contentType === 'module-federation' &&
+          registration.remoteEntryUrl && registration.moduleFederation) {
+        const experience = {
+          id: uuidv4(),
+          mfe,
+          capability,
+          contentType: 'module-federation',
+          output: {
+            remoteEntryUrl: registration.remoteEntryUrl,
+            scope: registration.moduleFederation.scope,
+            module: registration.moduleFederation.module,
+            component: registration.moduleFederation.component || capability,
+            props: props || {}
+          },
+          props: props || {},
+          createdAt: new Date().toISOString()
+        };
+        this.activeResolutions.set(sessionKey, { mfe, capability });
+        const experienceComponent = {
+          id: experience.id,
+          type: EXPERIENCE_COMPONENT_TYPE,
+          data: experience,
+          createdAt: experience.createdAt
+        };
+        this.storeComponent(experienceComponent);
+        this.publish(this.buildMessage({
+          direction: MessageDirection.COMPONENT,
+          kind: MessageKind.COMPONENT_UPDATE,
+          payload: experienceComponent,
+          metadata: { acknowledged: true, correlationId, error: null }
+        }));
+        logger.info({ code: 'DAE-253', event: 'EXPERIENCE_RELAYED', mfe, capability, expId: experience.id, clientSide: true },
+          'Client-side MFE experience relayed to renderers');
+        return;
+      }
+
       // Step 2: Authorize with the session's JWT/user context
       const authorized = await this.invokeMfeAuthorize(registration, session, correlationId);
       if (!authorized) {
