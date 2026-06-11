@@ -686,7 +686,11 @@ function createResolvers(daemon) {
 
     Subscription: {
       messages: {
-        subscribe: () => daemon.pubsub.asyncIterator('MESSAGES')
+        subscribe: () => {
+          const iteratorFactory = daemon.pubsub.asyncIterableIterator || daemon.pubsub.asyncIterator;
+          if (!iteratorFactory) throw new Error('PubSub implementation does not expose an async iterator API');
+          return iteratorFactory.call(daemon.pubsub, 'MESSAGES');
+        }
       }
     }
   };
