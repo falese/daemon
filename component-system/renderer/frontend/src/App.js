@@ -429,6 +429,62 @@ const UIRenderers = {
     );
   },
 
+  // An MFE-rendered experience (PLATFORM-CONTRACT v3.2). The MFE owns the
+  // output entirely — the renderer just knows how to host each contentType.
+  // HTML output can send actions by tagging elements with data-action
+  // (and optional data-* payload fields), e.g.:
+  //   <button data-action="SUBMIT" data-step="2">Next</button>
+  EXPERIENCE: ({ data, componentId, onAction }) => {
+    const { mfe, capability, output, contentType } = data;
+    const handleDelegatedAction = (e) => {
+      const target = e.target.closest('[data-action]');
+      if (!target) return;
+      const { action, ...payload } = target.dataset;
+      onAction(componentId, action, payload);
+    };
+    return (
+      <div className="max-w-sm mx-auto bg-white rounded-lg shadow-md mb-4 overflow-hidden">
+        <div className="flex items-center px-3 py-1.5 bg-purple-50 border-b border-purple-200 text-[10px] font-semibold tracking-wide text-purple-700 uppercase">
+          <span className="px-1.5 py-0.5 bg-purple-600 text-white rounded mr-2">MFE</span>
+          <span>{mfe}.{capability}</span>
+          <span className="ml-auto text-purple-400 normal-case">{contentType}</span>
+        </div>
+        <div className="p-4">
+          {contentType === 'text/html' && (
+            <div onClick={handleDelegatedAction} dangerouslySetInnerHTML={{ __html: String(output ?? '') }} />
+          )}
+          {contentType === 'application/json' && (
+            <pre className="text-xs bg-gray-100 p-3 rounded overflow-auto">{JSON.stringify(output, null, 2)}</pre>
+          )}
+          {contentType === 'module-federation' && (
+            <div className="text-sm text-gray-600">
+              <p className="font-medium">Module Federation experience</p>
+              <p className="text-xs text-gray-400 mt-1">
+                Host shells mount this via the SMT runtime (RemoteMFE). Payload:
+              </p>
+              <pre className="mt-2 text-xs bg-gray-100 p-3 rounded overflow-auto">{JSON.stringify(output, null, 2)}</pre>
+            </div>
+          )}
+          {!['text/html', 'application/json', 'module-federation'].includes(contentType) && (
+            <pre className="text-xs bg-gray-100 p-3 rounded overflow-auto">{JSON.stringify(output, null, 2)}</pre>
+          )}
+        </div>
+        <div className="px-4 pb-3">
+          <RuleEvaluation evalData={data._ruleEvaluation} />
+        </div>
+      </div>
+    );
+  },
+
+  // A registry resolution the daemon could not fulfil (unknown MFE, denied
+  // access, MFE unreachable). Surfaced so failures are visible, not silent.
+  RESOLUTION_ERROR: ({ data }) => (
+    <div className="max-w-sm mx-auto border border-red-400 bg-red-100 text-red-700 rounded p-4 mb-4">
+      <h3 className="font-bold mb-1">MFE resolution failed</h3>
+      <p className="text-sm">{data.mfe}.{data.capability}: {data.reason}</p>
+    </div>
+  ),
+
   FORM: ({ data, componentId, onAction }) => {
     const [formData, setFormData] = React.useState({});
     return (

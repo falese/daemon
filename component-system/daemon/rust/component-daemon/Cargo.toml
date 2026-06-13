@@ -15,6 +15,9 @@ chrono = { version = "0.4", features = ["serde"] }
 async-graphql = { version = "5.0", features = ["chrono", "uuid"] }
 async-graphql-warp = "5.0"
 warp = "0.3"
+# HTTP client for MFE capability calls (/authorize /load /render /refresh).
+# 0.14 matches the hyper version warp 0.3 already pins in Cargo.lock.
+hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
 url = "2.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

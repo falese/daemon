@@ -6,7 +6,7 @@ SERVICES = registry rust-daemon node-daemon react-renderer html-renderer
 # =====================
 # High-level Targets
 # =====================
-.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images contracts-install contracts-build contracts-typecheck contracts-clean
+.PHONY: help all build up down stack logs $(SERVICES) rebuild-% restart-% logs-% rules-logs form action test clean ps prune images contracts-install contracts-build contracts-typecheck contracts-test contracts-clean
 
 help:
 	@echo "Available targets:"; \
@@ -32,7 +32,8 @@ help:
 	 echo "  make images           List project images"; \
 	 echo "  make test             Run unit tests (registry rules engine)"; \
 	 echo "  make contracts-build      Build @control-plane/contracts TypeScript package"; \
-	 echo "  make contracts-typecheck  Type-check contracts without emitting output";
+	 echo "  make contracts-typecheck  Type-check contracts without emitting output"; \
+	 echo "  make contracts-test       Build contracts and run the node:test suite";
 
 all: build up
 
@@ -128,6 +129,9 @@ contracts-build: contracts-install
 
 contracts-typecheck: contracts-install
 	cd contracts && npm run typecheck
+
+contracts-test: contracts-install
+	cd contracts && npm test
 
 contracts-clean:
 	rm -rf contracts/dist contracts/node_modules

@@ -33,9 +33,58 @@ class ComponentRegistry {
   constructor() {
     this.components = new Map(); // id -> { component, actions: [], lastUpdated }
     this.rules = new Map();      // ruleName -> { condition(state, action), generate(state, action) }
+    this.mfes = new Map();       // mfeName -> MfeRegistration (ADR-054, PLATFORM-CONTRACT v3.2)
     this.pubsub = new PubSub();
 
     this.setupDefaultRules();
+  }
+
+  // ── MFE registration (PLATFORM-CONTRACT v3.2 / ADR-054) ────────────────────
+  // An MFE (or an operator) registers the MFE's describe() output plus the
+  // declarative routes that map state changes to it. Each route becomes a
+  // rule that generates a RESOLUTION component — the daemon picks it up,
+  // drives the MFE's render()/refresh(), and relays the experience.
+  //
+  // registration: { name, version, type, baseUrl, capabilities, contentType?, remoteEntryUrl?, manifest? }
+  // routes: [{ when: { componentType?, actionType?, stateKey? },
+  //            resolve: { capability, props? } }]
+
+  registerMfe(registration, routes = []) {
+    if (!registration?.name || !registration?.baseUrl) {
+      throw new Error('registerMfe: registration requires name and baseUrl');
+    }
+    this.mfes.set(registration.name, registration);
+
+    routes.forEach((route, index) => {
+      const when = route.when || {};
+      const ruleName = `mfe:${registration.name}:${index}`;
+      this.rules.set(ruleName, {
+        condition: (state, action) => {
+          if (when.componentType && state.component.type !== when.componentType) return false;
+          if (when.actionType && action.actionType !== when.actionType) return false;
+          if (when.stateKey && action.stateKey !== when.stateKey) return false;
+          // An empty `when` would fire on every action — require at least one predicate.
+          return Boolean(when.componentType || when.actionType || when.stateKey);
+        },
+        generate: (_state, action) => ({
+          type: 'RESOLUTION',
+          data: {
+            mfe: registration.name,
+            capability: route.resolve.capability,
+            // Action data flows into the render props so the MFE sees the
+            // submitted values / state payload that triggered the resolution.
+            props: Object.assign({}, route.resolve.props || {}, action.data || {})
+          }
+        })
+      });
+      console.log(`🧭 Registry: Registered route ${ruleName} (${JSON.stringify(when)} → ${registration.name}.${route.resolve.capability})`);
+    });
+
+    return registration;
+  }
+
+  getMfes() {
+    return Array.from(this.mfes.values());
   }
 
   // ── Rules ─────────────────────────────────────────────────────────────────
@@ -99,12 +148,23 @@ class ComponentRegistry {
 
   async handleAction(message) {
     const action = message.payload;
-    console.log(`🎯 Registry: Processing action componentId=${action.componentId} actionType=${action.actionType}`);
+    const correlationId = message.metadata?.correlationId || null;
+    console.log(`🎯 Registry: Processing action componentId=${action.componentId} actionType=${action.actionType}${action.stateKey ? ` stateKey=${action.stateKey}` : ''}`);
 
-    const state = this.components.get(action.componentId);
+    let state = this.components.get(action.componentId);
     if (!state) {
-      console.warn(`⚠️  Registry: No state for component ${action.componentId} — rules cannot be evaluated`);
-      return null;
+      // MFE-initiated state updates (updateControlPlaneState) reference an
+      // experience the registry never stored. Rules keyed on stateKey or
+      // actionType must still evaluate, so synthesise a minimal state.
+      if (!action.stateKey) {
+        console.warn(`⚠️  Registry: No state for component ${action.componentId} — rules cannot be evaluated`);
+        return null;
+      }
+      state = {
+        component: { id: action.componentId, type: 'UNKNOWN', data: {} },
+        actions: [],
+        lastUpdated: new Date().toISOString()
+      };
     }
 
     console.log(`🧪 Registry: Evaluating ${this.rules.size} rule(s) for type=${state.component.type} action=${action.actionType}`);
@@ -130,6 +190,15 @@ class ComponentRegistry {
       } catch (e) {
         console.error(`❌ Registry: Rule "${ruleName}" generate() threw:`, e.message);
         continue;
+      }
+
+      // RESOLUTION components carry routing context so the daemon can thread
+      // the originating correlationId and the user's session into the MFE call.
+      if (componentSpec.type === 'RESOLUTION') {
+        componentSpec.data = Object.assign({}, componentSpec.data, {
+          correlationId,
+          sessionId: action.context?.sessionId || null
+        });
       }
 
       // Attach rule evaluation metadata so the renderer can show which rule fired
@@ -219,11 +288,16 @@ const typeDefs = `
   }
 
   type Mutation {
-    # Inject a component directly (type = CARD | NOTIFICATION | FORM)
-    renderComponent(type: ComponentType!, data: JSON!): Component!
+    # Inject a component directly. Type is an open string (PLATFORM-CONTRACT
+    # v3.2): legacy CARD | NOTIFICATION | FORM plus RESOLUTION | EXPERIENCE.
+    renderComponent(type: String!, data: JSON!): Component!
 
     # Route a message envelope from the daemon (direction = ACTION | COMPONENT)
     handleMessage(message: String!): Boolean!
+
+    # Register an MFE (its describe() output) plus the routes that map state
+    # changes to its capabilities. registration/routes are JSON-encoded.
+    registerMfe(registration: JSON!, routes: JSON): Boolean!
   }
 
   type Subscription {
@@ -234,7 +308,9 @@ const typeDefs = `
 
   type Component {
     id: String!
-    type: ComponentType!
+    # Open string per PLATFORM-CONTRACT v3.2 — the control plane does not
+    # own a fixed component type library.
+    type: String!
     data: JSON!
     createdAt: String!
   }
@@ -251,12 +327,6 @@ const typeDefs = `
     component: Component!
     actions: [Action!]!
     lastUpdated: String!
-  }
-
-  enum ComponentType {
-    CARD
-    NOTIFICATION
-    FORM
   }
 `;
 
@@ -284,6 +354,10 @@ function createResolvers(registry) {
           throw new Error('handleMessage: message must be a valid JSON string');
         }
         return registry.handleMessage(parsed);
+      },
+      registerMfe: (_, { registration, routes }) => {
+        registry.registerMfe(registration, routes || []);
+        return true;
       }
     },
 
@@ -314,12 +388,29 @@ async function startRegistry(port = 4000) {
     res.json({ success: true, component });
   });
 
+  // REST: register an MFE + its resolution routes (PLATFORM-CONTRACT v3.2)
+  app.post('/mfes', (req, res) => {
+    try {
+      const { registration, routes } = req.body;
+      registry.registerMfe(registration, routes || []);
+      res.json({ success: true, mfe: registration.name });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // REST: list registered MFEs — the daemon's directory syncs from here
+  app.get('/mfes', (_req, res) => {
+    res.json({ mfes: registry.getMfes() });
+  });
+
   // Health check
   app.get('/', (_req, res) => {
     res.json({
       service: 'control-plane-registry',
       components: registry.getComponents().length,
-      endpoints: { GraphQL: '/graphql', REST: '/render' }
+      mfes: registry.getMfes().length,
+      endpoints: { GraphQL: '/graphql', REST: '/render', MFEs: '/mfes' }
     });
   });
 

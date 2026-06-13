@@ -208,4 +208,84 @@ describe('Rules Engine', () => {
       expect(publishedComponents.every(c => c.type === 'NOTIFICATION')).toBe(true);
     });
   });
+
+  // ── MFE registration + resolution routes (PLATFORM-CONTRACT v3.2 / ADR-054) ─
+
+  describe('MFE resolution routes', () => {
+    const registration = {
+      name: 'csv-analyzer',
+      version: '1.0.0',
+      type: 'tool',
+      baseUrl: 'http://csv-analyzer:8000',
+      capabilities: ['render', 'refresh', 'authorizeAccess']
+    };
+
+    test('registerMfe stores the registration and exposes it via getMfes', () => {
+      registry.registerMfe(registration, []);
+      expect(registry.getMfes()).toEqual([registration]);
+    });
+
+    test('registerMfe rejects a registration without name/baseUrl', () => {
+      expect(() => registry.registerMfe({ name: 'x' })).toThrow(/baseUrl/);
+    });
+
+    test('a matching route generates a RESOLUTION with correlation and session threading', async () => {
+      registry.registerMfe(registration, [
+        { when: { componentType: 'FORM', actionType: 'SUBMIT' },
+          resolve: { capability: 'DataAnalysis', props: { mode: 'full' } } }
+      ]);
+
+      const component = makeComponent('form-1', 'FORM', {});
+      registry.components.set('form-1', makeState(component));
+
+      const action = makeAction('act-9', 'form-1', 'SUBMIT', { fileId: 'f-1' });
+      action.context = { sessionId: 's-1', user: { id: 'u-1' }, application: 'web' };
+
+      await registry.handleAction({
+        direction: 'ACTION',
+        payload: action,
+        metadata: { correlationId: 'corr-9', acknowledged: false, error: null }
+      });
+
+      const resolution = publishedComponents.find(c => c.type === 'RESOLUTION');
+      expect(resolution).toBeDefined();
+      expect(resolution.data.mfe).toBe('csv-analyzer');
+      expect(resolution.data.capability).toBe('DataAnalysis');
+      // route props merged with the action data that triggered the resolution
+      expect(resolution.data.props).toMatchObject({ mode: 'full', fileId: 'f-1' });
+      // routing context for the daemon's per-session render/refresh decision
+      expect(resolution.data.correlationId).toBe('corr-9');
+      expect(resolution.data.sessionId).toBe('s-1');
+    });
+
+    test('a stateKey route fires even when the registry has no component state', async () => {
+      registry.registerMfe(registration, [
+        { when: { stateKey: 'analysis.complete' },
+          resolve: { capability: 'Visualization' } }
+      ]);
+
+      const action = makeAction('act-10', 'unknown-experience', 'STATE_UPDATE', { resultId: 'r-1' });
+      action.stateKey = 'analysis.complete';
+
+      await registry.handleAction({ direction: 'ACTION', payload: action });
+
+      const resolution = publishedComponents.find(c => c.type === 'RESOLUTION');
+      expect(resolution).toBeDefined();
+      expect(resolution.data.capability).toBe('Visualization');
+      expect(resolution.data.props).toMatchObject({ resultId: 'r-1' });
+    });
+
+    test('a route with an empty `when` never fires', async () => {
+      registry.registerMfe(registration, [
+        { when: {}, resolve: { capability: 'Everything' } }
+      ]);
+
+      const component = makeComponent('card-9', 'CARD', {});
+      registry.components.set('card-9', makeState(component));
+
+      await registry.handleAction({ direction: 'ACTION', payload: makeAction('act-11', 'card-9', 'CLICK') });
+
+      expect(publishedComponents.some(c => c.type === 'RESOLUTION')).toBe(false);
+    });
+  });
 });

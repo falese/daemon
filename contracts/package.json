@@ -9,10 +9,14 @@
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test __tests__/*.test.js"
   },
   "devDependencies": {
     "typescript": "^5.4.0"
   },
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@seans-mfe/contracts": "file:vendor/seans-mfe-contracts-0.1.0.tgz"
+  }
 }
